@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="lt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mano Žygių Žemėlapis</title>
+
+    <!-- Leaflet CSS (Žemėlapio stiliai) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <!-- Tavo CSS failas -->
+    <link rel="stylesheet" href="Untitled-1.css">
+</head>
+<body>
+
+    <header class="main-header">
+        <h1>🥾 Mano Žygių Žemėlapis</h1>
+    </header>
+
+    <main class="container">
+        <!-- Prisijungimo / Registracijos sekcija -->
+        <section class="card auth-card">
+            <h2>Prisijungimas / Registracija</h2>
+            <form id="auth-form" onsubmit="event.preventDefault();">
+                <input type="email" id="email" placeholder="El. paštas" required>
+                <input type="password" id="password" placeholder="Slaptažodis" required>
+                <button type="button" id="btn-login" class="btn btn-primary">Prisijungti</button>
+                <button type="button" id="btn-signup" class="btn btn-secondary">Registruotis</button>
+            </form>
+        </section>
+
+        <!-- Žemėlapio valdymo panelė -->
+        <section class="card map-controls">
+            <h2>Maršrutų žymėjimas</h2>
+            <div class="button-group">
+                <button id="btn-add-marker" class="btn">📍 Pridėti tašką (spausk ant žemėlapio)</button>
+                <button id="btn-draw-line" class="btn">🗺️ Brėžti maršrutą</button>
+                <button id="btn-save" class="btn btn-primary">💾 Išsaugoti žygį</button>
+                <button id="btn-clear" class="btn btn-danger">🗑️ Išvalyti žemėlapį</button>
+            </div>
+            <p id="status-text">Pasirinkite veiksmą arba spustelėkite ant žemėlapio.</p>
+        </section>
+
+        <!-- Žemėlapio konteineris -->
+        <section class="card map-card">
+            <div id="map"></div>
+        </section>
+    </main>
+
+    <!-- Leaflet JavaScript (Žemėlapio biblioteka) -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <!-- Supabase JS Biblioteka -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+    <!-- Tavo JavaScript failas -->
+    <script src="script.js"></script>
+</body>
+</html>
