@@ -1,59 +1,102 @@
 <!DOCTYPE html>
 <html lang="lt">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mano Žygių Žemėlapis</title>
-
-    <!-- Leaflet CSS (Žemėlapio stiliai) -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-
-    <!-- Tavo CSS failas -->
-    <link rel="stylesheet" href="Untitled-1.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Žygių Maršrutų Piešimas</title>
+  
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- Custom CSS -->
+  <link rel="stylesheet" href="Untitled-1.css">
 </head>
 <body>
 
-    <header class="main-header">
-        <h1>🥾 Mano Žygių Žemėlapis</h1>
+  <!-- AUTENTIFIKACIJOS LANGAS -->
+  <div id="authContainer" class="auth-box">
+    <h2 id="authTitle">Prisijungimas</h2>
+    
+    <form id="authForm">
+      <div class="form-group">
+        <label for="authEmail">El. paštas:</label>
+        <input type="email" id="authEmail" required placeholder="pavyzdys@gmail.com">
+      </div>
+      
+      <div class="form-group">
+        <label for="authPassword">Slaptažodis:</label>
+        <input type="password" id="authPassword" required placeholder="Bent 6 simboliai">
+      </div>
+      
+      <button type="submit" id="authSubmitBtn">Prisijungti</button>
+    </form>
+
+    <div class="toggle-auth">
+      <span id="toggleAuthText">Neturite paskyros?</span>
+      <button id="toggleAuthBtn" type="button">Registruotis</button>
+    </div>
+  </div>
+
+  <!-- PAGRINDINĖ PROGRAMOS SĄSAJA -->
+  <div id="appContainer" class="hidden">
+    <!-- Viršutinė juosta -->
+    <header class="app-header">
+      <div class="user-info">
+        Prisijungęs vartotojas: <strong id="userEmailDisplay">-</strong>
+      </div>
+      <button id="logoutBtn" class="danger-btn">Atsijungti</button>
     </header>
 
-    <main class="container">
-        <!-- Prisijungimo / Registracijos sekcija -->
-        <section class="card auth-card">
-            <h2>Prisijungimas / Registracija</h2>
-            <form id="auth-form" onsubmit="event.preventDefault();">
-                <input type="email" id="email" placeholder="El. paštas" required>
-                <input type="password" id="password" placeholder="Slaptažodis" required>
-                <button type="button" id="btn-login" class="btn btn-primary">Prisijungti</button>
-                <button type="button" id="btn-signup" class="btn btn-secondary">Registruotis</button>
-            </form>
-        </section>
+    <div class="main-layout">
+      <!-- Žemėlapis -->
+      <div id="map"></div>
 
-        <!-- Žemėlapio valdymo panelė -->
-        <section class="card map-controls">
-            <h2>Maršrutų žymėjimas</h2>
-            <div class="button-group">
-                <button id="btn-add-marker" class="btn">📍 Pridėti tašką (spausk ant žemėlapio)</button>
-                <button id="btn-draw-line" class="btn">🗺️ Brėžti maršrutą</button>
-                <button id="btn-save" class="btn btn-primary">💾 Išsaugoti žygį</button>
-                <button id="btn-clear" class="btn btn-danger">🗑️ Išvalyti žemėlapį</button>
-            </div>
-            <p id="status-text">Pasirinkite veiksmą arba spustelėkite ant žemėlapio.</p>
-        </section>
+      <!-- Valdymo skydelis -->
+      <aside class="sidebar">
+        <button id="toggleMenuBtn" class="primary-btn">Piešimo meniu</button>
 
-        <!-- Žemėlapio konteineris -->
-        <section class="card map-card">
-            <div id="map"></div>
-        </section>
-    </main>
+        <div id="drawMenu" class="menu-content hidden">
+          <h3>Sukurti maršrutą</h3>
+          
+          <div class="form-group">
+            <label for="lineName">Maršruto pavadinimas:</label>
+            <input type="text" id="lineName" placeholder="Pvz.: Žygis miške">
+          </div>
 
-    <!-- Leaflet JavaScript (Žemėlapio biblioteka) -->
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+          <div class="form-group">
+            <label>Pasirinkite spalvą:</label>
+            <div id="colorPalette" class="color-palette"></div>
+            <input type="color" id="customColor" value="#e6194B" style="margin-top: 8px; width: 100%;">
+          </div>
 
-    <!-- Supabase JS Biblioteka -->
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+          <button id="startDrawBtn" class="success-btn">Pradėti piešti</button>
+          <button id="stopDrawBtn" class="warning-btn hidden">Baigti piešimą</button>
 
-    <!-- Tavo JavaScript failas -->
-    <script src="script.js"></script>
+          <p id="status-text" class="status-msg"></p>
+        </div>
+
+        <hr>
+
+        <!-- Išsaugotų maršrutų sąrašas -->
+        <div class="routes-section">
+          <h3>Mano maršrutai</h3>
+          <div id="routesList" class="routes-list"></div>
+
+          <div class="delete-section">
+            <select id="deleteSelect">
+              <option value="">-- Pasirinkite maršrutą --</option>
+            </select>
+            <button id="deleteSelectedBtn" class="danger-btn" style="width: 100%; margin-top: 8px;">Trinti pasirinktą</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Supabase JS -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- Main Script -->
+  <script src="script.js"></script>
 </body>
 </html>
