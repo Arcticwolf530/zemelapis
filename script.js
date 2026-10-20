@@ -1,9 +1,24 @@
 // SUPABASE PRISIJUNGIMAS
 const SUPABASE_URL = 'https://hxbkmstegyimjkbnlgfa.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_lfVhNCx5D-iVDFOm44vjHQ_ErK0Zsnt';
+
+// „Prisiminti mane“: seansas saugomas localStorage (ilgam) arba sessionStorage (iki kortelės uždarymo)
+const REMEMBER_KEY = 'zygiai_remember';
+const authStorage = {
+    getItem: (k) => localStorage.getItem(k) ?? sessionStorage.getItem(k),
+    setItem: (k, v) => {
+        const keep = localStorage.getItem(REMEMBER_KEY) !== '0';
+        (keep ? localStorage : sessionStorage).setItem(k, v);
+        (keep ? sessionStorage : localStorage).removeItem(k);
+    },
+    removeItem: (k) => { localStorage.removeItem(k); sessionStorage.removeItem(k); }
+};
+
 let supabaseClient = null;
 if (window.supabase) {
-    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { storage: authStorage, persistSession: true, autoRefreshToken: true }
+    });
 }
 
 const TILE_URL = 'https://api.maptiler.com/maps/topo-v4/256/{z}/{x}/{y}.png?key=fyz6kNYuQtvSwaBwX6CJ';
@@ -40,43 +55,192 @@ const toggleAuthText = document.getElementById('toggleAuthText');
 const userEmailDisplay = document.getElementById('userEmailDisplay');
 const logoutBtn = document.getElementById('logoutBtn');
 
-let isSignUpMode = false;
+const authUsername = document.getElementById('authUsername');
+const usernameGroup = document.getElementById('usernameGroup');
+const authRow = document.getElementById('authRow');
+const rememberMe = document.getElementById('rememberMe');
+const forgotBtn = document.getElementById('forgotBtn');
+const authToggleRow = document.getElementById('authToggleRow');
+const otpForm = document.getElementById('otpForm');
+const otpCode = document.getElementById('otpCode');
+const otpHint = document.getElementById('otpHint');
+const resendOtpBtn = document.getElementById('resendOtpBtn');
+const forgotForm = document.getElementById('forgotForm');
+const forgotEmail = document.getElementById('forgotEmail');
+const resetForm = document.getElementById('resetForm');
+const resetCode = document.getElementById('resetCode');
+const resetPassword = document.getElementById('resetPassword');
+const authMsg = document.getElementById('authMsg');
 
-// Autentifikacijos perjungimas
+let authView = 'signin';          // signin | signup | verify | forgot | reset
+let pendingEmail = '';            // el. paštas, kuriam išsiųstas kodas
+let recoveryVerified = false;     // ar atstatymo kodas jau patvirtintas
+let appStarted = false;
+let currentUserId = null;
+
+const AUTH_TITLES = {
+    signin: 'Prisijungimas',
+    signup: 'Registracija',
+    verify: 'El. pašto patvirtinimas',
+    forgot: 'Slaptažodžio atstatymas',
+    reset: 'Naujas slaptažodis'
+};
+
+function setAuthMsg(text, isError = false) {
+    authMsg.textContent = text || '';
+    authMsg.classList.toggle('hidden', !text);
+    authMsg.classList.toggle('error', !!isError);
+}
+
+function showAuthView(view) {
+    authView = view;
+    const main = view === 'signin' || view === 'signup';
+    authTitle.textContent = AUTH_TITLES[view];
+    authForm.classList.toggle('hidden', !main);
+    authToggleRow.classList.toggle('hidden', !main);
+    usernameGroup.classList.toggle('hidden', view !== 'signup');
+    authRow.classList.toggle('hidden', view !== 'signin');
+    otpForm.classList.toggle('hidden', view !== 'verify');
+    forgotForm.classList.toggle('hidden', view !== 'forgot');
+    resetForm.classList.toggle('hidden', view !== 'reset');
+    authSubmitBtn.textContent = view === 'signup' ? 'Registruotis' : 'Prisijungti';
+    toggleAuthText.textContent = view === 'signup' ? 'Jau turite paskyrą?' : 'Neturite paskyros?';
+    toggleAuthBtn.textContent = view === 'signup' ? 'Prisijungti' : 'Registruotis';
+    if (view === 'forgot') recoveryVerified = false;
+    setAuthMsg('');
+}
+
+function applyRemember() {
+    try { localStorage.setItem(REMEMBER_KEY, rememberMe.checked ? '1' : '0'); } catch (_) {}
+}
+
+async function runBusy(form, fn) {
+    const btn = form.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    try { await fn(); }
+    catch (err) { setAuthMsg('Klaida: ' + err.message, true); }
+    finally { if (btn) btn.disabled = false; }
+}
+
+function startVerify(email) {
+    pendingEmail = email;
+    otpCode.value = '';
+    showAuthView('verify');
+    otpHint.textContent = `Išsiuntėme 6 skaitmenų kodą į ${email}. Įveskite jį žemiau (patikrinkite ir šlamšto aplanką).`;
+    otpCode.focus();
+}
+
+const onlyDigits = (v) => v.replace(/\D/g, '');
+
+// Prisijungimo / registracijos perjungimas
 if (toggleAuthBtn) {
     toggleAuthBtn.onclick = (e) => {
         e.preventDefault();
-        isSignUpMode = !isSignUpMode;
-        authTitle.textContent = isSignUpMode ? 'Registracija' : 'Prisijungimas';
-        authSubmitBtn.textContent = isSignUpMode ? 'Registruotis' : 'Prisijungti';
-        toggleAuthText.textContent = isSignUpMode ? 'Jau turite paskyrą?' : 'Neturite paskyros?';
-        toggleAuthBtn.textContent = isSignUpMode ? 'Prisijungti' : 'Registruotis';
+        showAuthView(authView === 'signin' ? 'signup' : 'signin');
     };
 }
+document.querySelectorAll('.js-auth-back').forEach(b => b.onclick = () => showAuthView('signin'));
+if (forgotBtn) forgotBtn.onclick = () => { forgotEmail.value = authEmail.value; showAuthView('forgot'); };
 
 // Prisijungimo / Registracijos formos pateikimas
 if (authForm) {
-    authForm.onsubmit = async (e) => {
+    authForm.onsubmit = (e) => {
         e.preventDefault();
-        const email = authEmail.value.trim();
-        const password = authPassword.value.trim();
+        runBusy(authForm, async () => {
+            const email = authEmail.value.trim();
+            const password = authPassword.value.trim();
 
-        if (isSignUpMode) {
-            const { data, error } = await supabaseClient.auth.signUp({ email, password });
-            if (error) alert('Registracijos klaida: ' + error.message);
-            else {
-                alert('Registracija sėkminga! Dabar galite prisijungti.');
-                isSignUpMode = false;
-                authTitle.textContent = 'Prisijungimas';
-                authSubmitBtn.textContent = 'Prisijungti';
+            if (authView === 'signup') {
+                const username = authUsername.value.trim();
+                if (username.length < 3) return setAuthMsg('Vartotojo vardas turi būti bent 3 simbolių', true);
+                if (password.length < 6) return setAuthMsg('Slaptažodis turi būti bent 6 simbolių', true);
+
+                applyRemember();
+                const { data, error } = await supabaseClient.auth.signUp({
+                    email, password, options: { data: { username } }
+                });
+                if (error) return setAuthMsg('Registracijos klaida: ' + error.message, true);
+                if (data.user && data.user.identities && data.user.identities.length === 0) {
+                    return setAuthMsg('Šis el. paštas jau užregistruotas. Prisijunkite.', true);
+                }
+                if (data.session) return initApp(data.user);   // jei patvirtinimas el. paštu išjungtas
+                startVerify(email);
+            } else {
+                applyRemember();
+                const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
+                if (error) {
+                    if (error.code === 'email_not_confirmed' || /not confirmed/i.test(error.message)) {
+                        await supabaseClient.auth.resend({ type: 'signup', email });
+                        return startVerify(email);
+                    }
+                    return setAuthMsg('Prisijungimo klaida: ' + error.message, true);
+                }
+                if (data.user) initApp(data.user);
             }
-        } else {
-            const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
-            if (error) alert('Prisijungimo klaida: ' + error.message);
-            else if (data.user) {
-                initApp(data.user);
+        });
+    };
+}
+
+// El. pašto patvirtinimas PIN kodu
+if (otpForm) {
+    otpForm.onsubmit = (e) => {
+        e.preventDefault();
+        runBusy(otpForm, async () => {
+            const token = onlyDigits(otpCode.value);
+            if (token.length !== 6) return setAuthMsg('Įveskite 6 skaitmenų kodą', true);
+            applyRemember();
+            const { data, error } = await supabaseClient.auth.verifyOtp({ email: pendingEmail, token, type: 'signup' });
+            if (error) return setAuthMsg('Neteisingas arba pasibaigęs kodas', true);
+            if (data.user) initApp(data.user);
+        });
+    };
+}
+if (resendOtpBtn) {
+    resendOtpBtn.onclick = async () => {
+        const { error } = await supabaseClient.auth.resend({ type: 'signup', email: pendingEmail });
+        setAuthMsg(error ? 'Nepavyko išsiųsti: ' + error.message : 'Naujas kodas išsiųstas', !!error);
+    };
+}
+
+// Pamiršau slaptažodį: 1) kodo užsakymas
+if (forgotForm) {
+    forgotForm.onsubmit = (e) => {
+        e.preventDefault();
+        runBusy(forgotForm, async () => {
+            const email = forgotEmail.value.trim();
+            const { error } = await supabaseClient.auth.resetPasswordForEmail(email);
+            if (error) return setAuthMsg('Klaida: ' + error.message, true);
+            pendingEmail = email;
+            resetCode.value = '';
+            resetPassword.value = '';
+            showAuthView('reset');
+            setAuthMsg('Jei šis el. paštas užregistruotas, išsiuntėme 6 skaitmenų kodą.');
+        });
+    };
+}
+
+// Pamiršau slaptažodį: 2) kodas + naujas slaptažodis
+if (resetForm) {
+    resetForm.onsubmit = (e) => {
+        e.preventDefault();
+        runBusy(resetForm, async () => {
+            const newPass = resetPassword.value.trim();
+            if (newPass.length < 6) return setAuthMsg('Slaptažodis turi būti bent 6 simbolių', true);
+
+            let user = null;
+            if (!recoveryVerified) {
+                const token = onlyDigits(resetCode.value);
+                if (token.length !== 6) return setAuthMsg('Įveskite 6 skaitmenų kodą', true);
+                applyRemember();
+                const { data, error } = await supabaseClient.auth.verifyOtp({ email: pendingEmail, token, type: 'recovery' });
+                if (error) return setAuthMsg('Neteisingas arba pasibaigęs kodas', true);
+                recoveryVerified = true;
+                user = data.user;
             }
-        }
+            const { data: upd, error: upErr } = await supabaseClient.auth.updateUser({ password: newPass });
+            if (upErr) return setAuthMsg('Nepavyko pakeisti slaptažodžio: ' + upErr.message, true);
+            initApp(upd.user || user);
+        });
     };
 }
 
@@ -87,7 +251,18 @@ if (logoutBtn) {
     };
 }
 
+// Automatinis prisijungimas, jei išsaugotas seansas („Prisiminti mane“)
+if (supabaseClient) {
+    supabaseClient.auth.getSession().then(({ data }) => {
+        if (data && data.session && authView !== 'reset') initApp(data.session.user);
+    });
+}
+
 function initApp(user) {
+    if (appStarted) return;
+    appStarted = true;
+    currentUserId = user.id;
+
     authContainer.classList.add('hidden');
     appContainer.classList.remove('hidden');
     userEmailDisplay.textContent = user.email;
@@ -125,6 +300,26 @@ const cardSpeed = document.getElementById('card-speed');
 const cardElevation = document.getElementById('card-elevation');
 const cardDate = document.getElementById('card-date');
 const closeBtn = document.getElementById('close-btn');
+const sharePublic = document.getElementById('sharePublic');
+const cardShare = document.getElementById('card-share');
+const cardPublicToggle = document.getElementById('card-public-toggle');
+let cardLine = null;
+
+// Žygio viešumo perjungimas info kortelėje
+if (cardPublicToggle) {
+    cardPublicToggle.onchange = async () => {
+        if (!cardLine) return;
+        const want = cardPublicToggle.checked;
+        const { data, error } = await supabaseClient.from('zygiai')
+            .update({ is_public: want }).eq('id', cardLine.id).eq('user_id', currentUserId).select();
+        if (error || !data || !data.length) {
+            cardPublicToggle.checked = !want;
+            alert('Nepavyko pakeisti žygio viešumo');
+        } else {
+            cardLine.isPublic = want;
+        }
+    };
+}
 
 let selectedPoly = null;
 function clearSelection() {
@@ -147,7 +342,7 @@ function showRouteCard(line, poly) {
         poly.setStyle({ weight: LINE_WEIGHT_ACTIVE, opacity: 1 });
         poly.bringToFront();
     }
-    cardTitle.textContent = `#${line.id}: ${line.name}`;
+    cardTitle.textContent = line.social ? line.name : `#${line.id}: ${line.name}`;
     cardDot.style.background = line.color;
     cardDuration.textContent = formatTime(line.duration || 0);
     cardDistance.textContent = formatDist(line.distance || 0);
@@ -156,7 +351,12 @@ function showRouteCard(line, poly) {
     const hrs = (line.duration || 0) / 3600;
     cardSpeed.textContent = hrs > 0 && km > 0 ? (km / hrs).toFixed(1) + ' km/h' : '0.0 km/h';
     cardElevation.textContent = `${Math.round(line.elevationGain || 0)} m`;
-    cardDate.textContent = line.date || '-';
+    cardDate.textContent = line.social ? `@${line.author} · ${line.date || '-'}` : (line.date || '-');
+
+    cardLine = line;
+    const canShare = !line.social && !(isGpsRecording && line === currentLineData);
+    cardShare.classList.toggle('hidden', !canShare);
+    cardPublicToggle.checked = !!line.isPublic;
 
     infoCard.classList.remove('hidden');
 }
@@ -186,6 +386,16 @@ navItems.forEach(item => {
             setTimeout(() => {
                 mapHistory.invalidateSize({ pan: false });
                 renderHistoryPolylines();
+            }, 50);
+        } else if (tabName === 'social') {
+            if (!mapSocial) {
+                mapSocial = createMap('map-social');
+                mapSocial.setView(map.getCenter(), map.getZoom());
+                mapSocial.on('click', closeCard);
+            }
+            setTimeout(() => {
+                mapSocial.invalidateSize({ pan: false });
+                loadSocial();
             }, 50);
         }
     };
@@ -232,7 +442,8 @@ const calcDist = (pts) => {
 
 // Supabase duomenų sinchronizacija
 async function uzkrautiIsSupabase() {
-    const { data, error } = await supabaseClient.from('zygiai').select('*');
+    // Filtruojame pagal savo user_id, nes viešų žygių RLS taisyklė leidžia matyti ir kitų žygius
+    const { data, error } = await supabaseClient.from('zygiai').select('*').eq('user_id', currentUserId);
     if (data) {
         linesData = data.map(item => ({
             id: item.id,
@@ -242,7 +453,8 @@ async function uzkrautiIsSupabase() {
             distance: item.distance || 0,
             duration: item.duration || 0,
             elevationGain: item.elevationGain || 0,
-            date: item.date || '-'
+            date: item.date || '-',
+            isPublic: !!item.is_public
         }));
 
         linesData.forEach(line => {
@@ -267,6 +479,7 @@ async function isaugotiISupabase(line) {
         duration: line.duration,
         elevationGain: line.elevationGain,
         date: line.date,
+        is_public: !!line.isPublic,
         user_id: user.id // <--- Priskiriame prisijungusio vartotojo ID dėl RLS apsaugos
     }]).select();
 
@@ -369,7 +582,8 @@ function startGps() {
         currentLineData = {
             id, name: lineNameInput.value.trim() || `Žygis ${id}`,
             color: selectedColor, date: new Date().toLocaleDateString('lt-LT'),
-            distance: 0, duration: 0, elevationGain: 0, points: []
+            distance: 0, duration: 0, elevationGain: 0, points: [],
+            isPublic: sharePublic.checked
         };
         linesData.push(currentLineData);
         createPolyline(currentLineData);
@@ -485,4 +699,118 @@ if (deleteSelectedBtn) {
         updateSelects();
         closeCard();
     };
+}
+
+// ======================= SOCIALINĖ SKILTIS =======================
+let mapSocial = null;
+let socialData = [];
+let socialProfiles = [];
+let socialFilter = null;
+let socialFitted = false;
+const socialPolylineMap = new Map();
+const socialEmpty = document.getElementById('social-empty');
+const usersMenu = document.getElementById('usersMenu');
+const usersList = document.getElementById('usersList');
+const toggleUsersBtn = document.getElementById('toggleUsersBtn');
+
+if (toggleUsersBtn) toggleUsersBtn.onclick = () => usersMenu.classList.toggle('hidden');
+
+async function loadSocial() {
+    const [routesRes, profilesRes] = await Promise.all([
+        supabaseClient.from('zygiai').select('*').eq('is_public', true).order('id', { ascending: false }).limit(300),
+        supabaseClient.from('profiles').select('id, username').limit(500)
+    ]);
+    if (routesRes.error) return console.error('Klaida kraunant viešus žygius:', routesRes.error.message);
+
+    socialProfiles = profilesRes.data || [];
+    const names = new Map(socialProfiles.map(p => [p.id, p.username]));
+    socialData = (routesRes.data || []).map(item => ({
+        id: item.id,
+        social: true,
+        userId: item.user_id,
+        author: names.get(item.user_id) || 'Žygininkas',
+        name: item.title || 'Maršrutas',
+        color: item.color || '#2563eb',
+        points: item.coordinates || [],
+        distance: item.distance || 0,
+        duration: item.duration || 0,
+        elevationGain: item.elevationGain || 0,
+        date: item.date || '-',
+        isPublic: true
+    }));
+    if (socialFilter && !socialProfiles.some(p => p.id === socialFilter)) socialFilter = null;
+
+    renderUsersMenu();
+    renderSocialPolylines();
+    if (!socialFitted && socialPolylineMap.size) { fitSocial(); socialFitted = true; }
+}
+
+function renderSocialPolylines() {
+    if (!mapSocial) return;
+    selectedPoly = null;
+    socialPolylineMap.forEach(poly => mapSocial.removeLayer(poly));
+    socialPolylineMap.clear();
+
+    let count = 0;
+    socialData.forEach(line => {
+        if (socialFilter && line.userId !== socialFilter) return;
+        if (!line.points || line.points.length === 0) return;
+        const poly = L.polyline(line.points, { color: line.color, weight: LINE_WEIGHT, opacity: 0.85 }).addTo(mapSocial);
+        poly.on('click', (e) => {
+            L.DomEvent.stopPropagation(e);
+            showRouteCard(line, poly);
+        });
+        socialPolylineMap.set(line.id, poly);
+        count++;
+    });
+    socialEmpty.classList.toggle('hidden', count > 0);
+}
+
+function fitSocial() {
+    if (!mapSocial) return;
+    const all = L.latLngBounds([]);
+    socialPolylineMap.forEach(poly => all.extend(poly.getBounds()));
+    if (all.isValid()) mapSocial.fitBounds(all, { padding: [60, 60], maxZoom: 17 });
+}
+
+function makeUserRow(id, name, count) {
+    const row = document.createElement('div');
+    row.className = 'user-row' + (socialFilter === id ? ' active' : '');
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+
+    const avatar = document.createElement('span');
+    avatar.className = 'avatar';
+    avatar.textContent = (name || '?').charAt(0).toUpperCase();
+    const label = document.createElement('span');
+    label.className = 'name';
+    label.textContent = name;            // textContent – saugu, vartotojo vardas nėra interpretuojamas kaip HTML
+    const cnt = document.createElement('span');
+    cnt.className = 'count';
+    cnt.textContent = count;
+    row.append(avatar, label, cnt);
+
+    row.onclick = () => {
+        socialFilter = id;
+        renderUsersMenu();
+        renderSocialPolylines();
+        fitSocial();
+        usersMenu.classList.add('hidden');
+        closeCard();
+    };
+    return row;
+}
+
+function renderUsersMenu() {
+    usersList.innerHTML = '';
+    const counts = {};
+    socialData.forEach(l => { counts[l.userId] = (counts[l.userId] || 0) + 1; });
+
+    usersList.appendChild(makeUserRow(null, 'Visi žygininkai', socialData.length));
+    [...socialProfiles]
+        .sort((a, b) => (counts[b.id] || 0) - (counts[a.id] || 0) || a.username.localeCompare(b.username))
+        .forEach(p => {
+            const label = p.id === currentUserId ? `${p.username} (Jūs)` : p.username;
+            usersList.appendChild(makeUserRow(p.id, label, counts[p.id] || 0));
+        });
 }

@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <link rel="stylesheet" href="Untitled-1.css">
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
@@ -17,7 +17,13 @@
     <div id="authContainer" class="auth-overlay">
         <div class="auth-card">
             <h2 id="authTitle">Prisijungimas</h2>
+
+            <!-- Prisijungimas / registracija -->
             <form id="authForm">
+                <div id="usernameGroup" class="form-group hidden" style="text-align: left; margin-bottom: 12px;">
+                    <label class="field-label">Vartotojo vardas</label>
+                    <input type="text" id="authUsername" maxlength="24" placeholder="3–24 simboliai">
+                </div>
                 <div class="form-group" style="text-align: left; margin-bottom: 12px;">
                     <label class="field-label">El. paštas</label>
                     <input type="email" id="authEmail" required placeholder="pavyzdys@gmail.com">
@@ -26,12 +32,58 @@
                     <label class="field-label">Slaptažodis</label>
                     <input type="password" id="authPassword" required placeholder="Bent 6 simboliai">
                 </div>
+                <div id="authRow" class="auth-row">
+                    <label class="check-label"><input type="checkbox" id="rememberMe" checked><span>Prisiminti mane</span></label>
+                    <button type="button" id="forgotBtn" class="link-btn">Pamiršau slaptažodį?</button>
+                </div>
                 <button type="submit" id="authSubmitBtn" class="gps-btn" style="width: 100%;">Prisijungti</button>
             </form>
-            <div style="margin-top: 15px; font-size: 13px;">
+            <div id="authToggleRow" style="margin-top: 15px; font-size: 13px;">
                 <span id="toggleAuthText">Neturite paskyros?</span>
                 <button id="toggleAuthBtn" type="button" style="background: none; border: none; color: var(--primary); font-weight: 600; cursor: pointer; margin-left: 5px;">Registruotis</button>
             </div>
+
+            <!-- El. pašto patvirtinimas PIN kodu -->
+            <form id="otpForm" class="hidden">
+                <p id="otpHint" class="auth-hint"></p>
+                <input type="text" id="otpCode" class="otp-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="------" required>
+                <button type="submit" class="gps-btn" style="width: 100%;">Patvirtinti</button>
+                <div class="auth-links">
+                    <button type="button" id="resendOtpBtn" class="link-btn">Siųsti kodą iš naujo</button>
+                    <button type="button" class="link-btn js-auth-back">Atgal</button>
+                </div>
+            </form>
+
+            <!-- Slaptažodžio atstatymas: 1) el. paštas -->
+            <form id="forgotForm" class="hidden">
+                <p class="auth-hint">Įveskite el. paštą – atsiųsime 6 skaitmenų kodą slaptažodžiui atstatyti.</p>
+                <div class="auth-field">
+                    <label class="field-label">El. paštas</label>
+                    <input type="email" id="forgotEmail" required placeholder="pavyzdys@gmail.com">
+                </div>
+                <button type="submit" class="gps-btn" style="width: 100%;">Siųsti kodą</button>
+                <div class="auth-links">
+                    <button type="button" class="link-btn js-auth-back">Atgal</button>
+                </div>
+            </form>
+
+            <!-- Slaptažodžio atstatymas: 2) kodas + naujas slaptažodis -->
+            <form id="resetForm" class="hidden">
+                <div class="auth-field">
+                    <label class="field-label">Kodas iš el. laiško</label>
+                    <input type="text" id="resetCode" class="otp-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="------" required>
+                </div>
+                <div class="auth-field">
+                    <label class="field-label">Naujas slaptažodis</label>
+                    <input type="password" id="resetPassword" required placeholder="Bent 6 simboliai">
+                </div>
+                <button type="submit" class="gps-btn" style="width: 100%;">Atnaujinti slaptažodį</button>
+                <div class="auth-links">
+                    <button type="button" class="link-btn js-auth-back">Atšaukti</button>
+                </div>
+            </form>
+
+            <div id="authMsg" class="auth-msg hidden"></div>
         </div>
     </div>
 
@@ -45,10 +97,20 @@
 
         <!-- Socialinė skiltis -->
         <div id="tab-social" class="tab-content">
-            <div class="empty-tab-message">
-                <svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-                <span>Socialinė skiltis netrukus</span>
+            <div id="map-social"></div>
+
+            <div class="menu-panel">
+                <button id="toggleUsersBtn" class="fab-chip" aria-label="Žygininkai">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                    Žygininkai
+                </button>
+                <div id="usersMenu" class="draw-menu hidden">
+                    <label class="field-label">Registruoti žygininkai</label>
+                    <div id="usersList" class="users-list"></div>
+                </div>
             </div>
+
+            <div id="social-empty" class="hidden">Dar nėra viešų žygių</div>
         </div>
 
         <!-- Įrašymo skiltis -->
@@ -76,6 +138,11 @@
                         <label><input type="radio" name="lineOption" value="continue"><span>Tęsti esamą</span></label>
                     </div>
                     <select id="lineSelect" class="hidden"></select>
+
+                    <div class="switch-row">
+                        <span class="field-label" style="margin: 0;">Dalintis viešai</span>
+                        <label class="switch"><input type="checkbox" id="sharePublic"><span class="slider"></span></label>
+                    </div>
 
                     <button id="gpsDrawBtn" class="gps-btn">Pradėti GPS įrašymą</button>
 
@@ -117,6 +184,10 @@
                     <small id="card-date">-</small>
                 </div>
                 <button id="close-btn" aria-label="Uždaryti">&times;</button>
+            </div>
+            <div id="card-share" class="card-share hidden">
+                <span>Viešas žygis</span>
+                <label class="switch"><input type="checkbox" id="card-public-toggle"><span class="slider"></span></label>
             </div>
             <div class="card-grid">
                 <div class="tile"><span>Atstumas</span><strong id="card-distance">-</strong></div>
