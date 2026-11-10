@@ -1,24 +1,37 @@
-// ==========================================
-// SUPABASE PRISIJUNGIMAS IR SEANSAS
-// ==========================================
+// SUPABASE PRISIJUNGIMAS
 const SUPABASE_URL = 'https://hxbkmstegyimjkbnlgfa.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_lfVhNCx5D-iVDFOm44vjHQ_ErK0Zsnt';
 
-const REMEMBER_KEY = 'zygiai_remember';
+// „Prisiminti mane": pažymėta varnelė – sesija išlieka localStorage (net uždarius naršyklę),
+// nepažymėta – sessionStorage (dingsta uždarius naršyklę)
+const REMEMBER_KEY = 'zygiaiPrisiminti';
 const authStorage = {
-    getItem: (k) => localStorage.getItem(k) ?? sessionStorage.getItem(k),
-    setItem: (k, v) => {
-        const keep = localStorage.getItem(REMEMBER_KEY) !== '0';
-        (keep ? localStorage : sessionStorage).setItem(k, v);
-        (keep ? sessionStorage : localStorage).removeItem(k);
+    getItem: (key) => {
+        try {
+            if (localStorage.getItem(REMEMBER_KEY) === '1') return localStorage.getItem(key);
+            return sessionStorage.getItem(key);
+        } catch (e) { return null; }
     },
-    removeItem: (k) => { localStorage.removeItem(k); sessionStorage.removeItem(k); }
+    setItem: (key, value) => {
+        try {
+            if (localStorage.getItem(REMEMBER_KEY) === '1') localStorage.setItem(key, value);
+            else sessionStorage.setItem(key, value);
+        } catch (e) {}
+    },
+    removeItem: (key) => {
+        try { localStorage.removeItem(key); sessionStorage.removeItem(key); } catch (e) {}
+    }
 };
 
 let supabaseClient = null;
 if (window.supabase) {
     supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-        auth: { storage: authStorage, persistSession: true, autoRefreshToken: true }
+        auth: {
+            storage: authStorage,       // „Prisiminti mane“ logika
+            persistSession: true,
+            autoRefreshToken: true,
+            detectSessionInUrl: false   // naudojame 6 skaitmenų kodus, o ne nuorodas laiškuose
+        }
     });
 }
 
@@ -27,6 +40,7 @@ const TILE_OPTIONS = { attribution: '&copy; MapTiler &copy; OpenStreetMap', maxZ
 const DEFAULT_CENTER = [54.74622, 25.21294];
 const DEFAULT_ZOOM = 13;
 const LINE_WEIGHT = 6;
+const LINE_WEIGHT_ACTIVE = 10;
 
 const ICONS = {
     walk: '<circle cx="13" cy="4" r="2"/><path d="M12 8l-2 5 3 3v5M10 13l-3 2M12 8l4 3"/>',
@@ -45,7 +59,7 @@ const ACTIVITIES = {
 let selectedActivity = 'walk';
 const iconSvg = (type, size = 18) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[type] || ICONS.other}</svg>`;
 
-function fmtSpeedFor(type, ms) {
+function fmtSpeedFor(type, ms) {   // ms = m/s
     const a = ACTIVITIES[type] || ACTIVITIES.walk;
     if (a.pace) {
         if (!(ms > 0.3)) return '--';
@@ -54,27 +68,47 @@ function fmtSpeedFor(type, ms) {
     }
     return `${(ms * 3.6).toFixed(1)} km/h`;
 }
+// Veiklos tipas saugomas ir lokaliai, jei lentelėje nėra stulpelio „activity“
+const getTypeMap = () => { try { return JSON.parse(localStorage.getItem('zygiaiTipai') || '{}'); } catch (e) { return {}; } };
+const setLocalType = (id, t) => { try { const m = getTypeMap(); m[id] = t; localStorage.setItem('zygiaiTipai', JSON.stringify(m)); } catch (e) {} };
+
+const hm = (d) => d.toLocaleTimeString('lt-LT', { hour: '2-digit', minute: '2-digit' });
+// Pradžios/pabaigos laikas saugomas esamame „date“ lauke: „2026-10-20|07:42|09:15“ (DB keisti nereikia)
+const encodeDate = (l) => l.startedAt ? `${l.date}|${l.startedAt}|${l.endedAt || ''}` : l.date;
+const whenText = (l) => l.startedAt ? `${l.date}, ${l.startedAt}${l.endedAt ? '–' + l.endedAt : ''}` : (l.date || '-');
 
 let map = null;
 let mapHistory = null;
-let mapSocial = null;
-
 const historyPolylineMap = new Map();
-const socialPolylineMap = new Map();
+let historyHalo = null;
 
-const colors = ['#384a31', '#1f6feb', '#0e9f6e', '#e11d48', '#f59e0b', '#8b5cf6'];
+const colors = ['#1f6feb', '#0e9f6e', '#e11d48', '#f59e0b', '#8b5cf6'];
 let selectedColor = colors[0];
 let linesData = [];
-let publicLinesData = [];
-let userProfiles = new Map();
 
-let watchId = null, timerInterval = null, totalElapsed = 0;
+let watchId = null, timerInterval = null, startTime = null, totalElapsed = 0;
 let userMarker = null, accuracyCircle = null, isGpsRecording = false;
 let currentLineData = null, currentPolyline = null;
-let appStarted = false;
-let currentUserId = null;
 
-// AUTENTIFIKACIJOS VALDYMAS
+// ---- GPS filtravimo parametrai ----
+const MAX_ACCURACY = 25;        // m  – fiksavimai, blogesni už šį, ignoruojami
+let MIN_STEP = 5;               // m  – priklauso nuo veiklos tipo
+let MAX_SPEED = 12;             // m/s – priklauso nuo veiklos tipo
+const MAX_ALT_ACCURACY = 15;    // m  – blogesnio aukščio tikslumo ignoruojame
+const ELEV_THRESHOLD = 7;       // m  – kilimas skaičiuojamas tik pasikeitus aukščiui bent tiek
+const STILL_TIMEOUT = 6000;     // ms – tiek be judėjimo = greitis 0
+
+let lastAny = null;             // { t, speed } paskutinis tikslus fiksavimas (Doplerio greičiui)
+let lastFix = null;             // { pt, t } paskutinis priimtas taškas
+let rejectedInRow = 0;
+let curSpeed = 0, lastMoveTime = 0;
+let activeMs = 0, lastTick = 0, isPaused = false, autoPaused = false, autoPauseOn = true;
+const AUTO_PAUSE_DELAY = 8000;  // ms be judėjimo -> automatinė pauzė
+const activeNow = () => activeMs + ((isPaused || autoPaused || !lastTick) ? 0 : Date.now() - lastTick);
+let altWindow = [], smoothAlt = null, anchorAlt = null;
+let wakeLock = null;
+
+// DOM Elementai autentifikacijai
 const authContainer = document.getElementById('authContainer');
 const appContainer = document.getElementById('appContainer');
 const authForm = document.getElementById('authForm');
@@ -86,285 +120,371 @@ const toggleAuthBtn = document.getElementById('toggleAuthBtn');
 const toggleAuthText = document.getElementById('toggleAuthText');
 const userEmailDisplay = document.getElementById('userEmailDisplay');
 const logoutBtn = document.getElementById('logoutBtn');
-
-const authUsername = document.getElementById('authUsername');
-const usernameGroup = document.getElementById('usernameGroup');
-const authRow = document.getElementById('authRow');
-const rememberMe = document.getElementById('rememberMe');
+const rememberChk = document.getElementById('rememberChk');
 const forgotBtn = document.getElementById('forgotBtn');
-const authToggleRow = document.getElementById('authToggleRow');
-const otpForm = document.getElementById('otpForm');
-const otpCode = document.getElementById('otpCode');
-const otpHint = document.getElementById('otpHint');
-const resendOtpBtn = document.getElementById('resendOtpBtn');
-const forgotForm = document.getElementById('forgotForm');
-const forgotEmail = document.getElementById('forgotEmail');
-const resetForm = document.getElementById('resetForm');
-const resetCode = document.getElementById('resetCode');
-const resetPassword = document.getElementById('resetPassword');
 const authMsg = document.getElementById('authMsg');
+const resetForm = document.getElementById('resetForm');
+const resetEmail = document.getElementById('resetEmail');
+const resetSubmitBtn = document.getElementById('resetSubmitBtn');
+const resetBackBtn = document.getElementById('resetBackBtn');
+const resetMsg = document.getElementById('resetMsg');
+const codeForm = document.getElementById('codeForm');
+const codeHint = document.getElementById('codeHint');
+const otpCode = document.getElementById('otpCode');
+const newPassGroup = document.getElementById('newPassGroup');
+const newPassword = document.getElementById('newPassword');
+const codeSubmitBtn = document.getElementById('codeSubmitBtn');
+const codeMsg = document.getElementById('codeMsg');
+const codeBackBtn = document.getElementById('codeBackBtn');
+const resendBtn = document.getElementById('resendBtn');
+const toggleRow = document.getElementById('toggleRow');
 
-let authView = 'signin';
-let pendingEmail = '';
-let recoveryVerified = false;
+let isSignUpMode = false;
+let currentUser = null;      // prisijungęs vartotojas
+let pendingVerify = null;    // laukiantis patvirtinimas { email, type: 'signup' | 'recovery' }
+let lastSaveError = '';      // paskutinė serverio klaida – rodome vartotojui
 
-const AUTH_TITLES = {
-    signin: 'Prisijungimas',
-    signup: 'Registracija',
-    verify: 'El. pašto patvirtinimas',
-    forgot: 'Slaptažodžio atstatymas',
-    reset: 'Naujas slaptažodis'
-};
-
-function setAuthMsg(text, isError = false) {
-    if (!authMsg) return;
-    authMsg.textContent = text || '';
-    authMsg.classList.toggle('hidden', !text);
-    authMsg.classList.toggle('error', !!isError);
+function setRememberFlag(on) {
+    try {
+        localStorage.setItem(REMEMBER_KEY, on ? '1' : '0');
+        sessionStorage.removeItem(REMEMBER_KEY);
+    } catch (e) {}
 }
 
-function showAuthView(view) {
-    authView = view;
-    const main = view === 'signin' || view === 'signup';
-    if (authTitle) authTitle.textContent = AUTH_TITLES[view];
-    if (authForm) authForm.classList.toggle('hidden', !main);
-    if (authToggleRow) authToggleRow.classList.toggle('hidden', !main);
-    if (usernameGroup) usernameGroup.classList.toggle('hidden', view !== 'signup');
-    if (authRow) authRow.classList.toggle('hidden', view !== 'signin');
-    if (otpForm) otpForm.classList.toggle('hidden', view !== 'verify');
-    if (forgotForm) forgotForm.classList.toggle('hidden', view !== 'forgot');
-    if (resetForm) resetForm.classList.toggle('hidden', view !== 'reset');
-    if (authSubmitBtn) authSubmitBtn.textContent = view === 'signup' ? 'Registruotis' : 'Prisijungti';
-    if (toggleAuthText) toggleAuthText.textContent = view === 'signup' ? 'Jau turite paskyrą?' : 'Neturite paskyros?';
-    if (toggleAuthBtn) toggleAuthBtn.textContent = view === 'signup' ? 'Prisijungti' : 'Registruotis';
-    if (view === 'forgot') recoveryVerified = false;
-    setAuthMsg('');
+// Autentifikacijos klaidų vertimas į lietuvių kalbą
+function translateAuthError(error) {
+    const m = (error && error.message) || '';
+    if (/Invalid login credentials/i.test(m)) return 'Netinkamas el. paštas arba slaptažodis.';
+    if (/already registered|already exists/i.test(m)) return 'Šis el. paštas jau užregistruotas.';
+    if (/at least/i.test(m) && /password/i.test(m)) return 'Slaptažodis per trumpas – mažiausiai 6 simboliai.';
+    if (/validate email|invalid email|invalid format/i.test(m)) return 'Netinkamas el. pašto adresas.';
+    if (/not confirmed/i.test(m)) return 'El. paštas dar nepatvirtintas – patikrinkite gautus laiškus.';
+    if (/rate limit|Too many/i.test(m)) return 'Per daug bandymų – palaukite kelias minutes ir bandykite vėl.';
+    if (/Signups not allowed/i.test(m)) return 'Naujų paskyrų registracija šiuo metu išjungta.';
+    return m;
 }
 
-function applyRemember() {
-    try { localStorage.setItem(REMEMBER_KEY, rememberMe && rememberMe.checked ? '1' : '0'); } catch (_) {}
+// Žinučių rodymas formose (type: 'err' – raudona, kitaip – žalia)
+function setMsg(el, text, type) {
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('hidden', !text);
+    el.classList.toggle('err', !!text && type === 'err');
+    el.classList.toggle('ok', !!text && type !== 'err');
 }
 
-async function runBusy(form, fn) {
-    const btn = form.querySelector('button[type="submit"]');
-    if (btn) btn.disabled = true;
-    try { await fn(); }
-    catch (err) { setAuthMsg('Klaida: ' + err.message, true); }
-    finally { if (btn) btn.disabled = false; }
-}
-
-function startVerify(email) {
-    pendingEmail = email;
-    if (otpCode) otpCode.value = '';
-    showAuthView('verify');
-    if (otpHint) otpHint.textContent = `Išsiuntėme 6 skaitmenų kodą į ${email}. Įveskite jį žemiau.`;
-    if (otpCode) otpCode.focus();
-}
-
-const onlyDigits = (v) => v.replace(/\D/g, '');
-
-if (toggleAuthBtn) {
-    toggleAuthBtn.onclick = (e) => {
-        e.preventDefault();
-        showAuthView(authView === 'signin' ? 'signup' : 'signin');
-    };
-}
-document.querySelectorAll('.js-auth-back').forEach(b => b.onclick = () => showAuthView('signin'));
-if (forgotBtn) forgotBtn.onclick = () => {
-    if (forgotEmail && authEmail) forgotEmail.value = authEmail.value;
-    showAuthView('forgot');
-};
-
-if (otpCode) otpCode.oninput = () => otpCode.value = onlyDigits(otpCode.value);
-if (resetCode) resetCode.oninput = () => resetCode.value = onlyDigits(resetCode.value);
-
-if (authForm) {
-    authForm.onsubmit = async (e) => {
-        e.preventDefault();
-        applyRemember();
-        const email = authEmail.value.trim();
-        const password = authPassword.value;
-
-        if (authView === 'signup') {
-            const username = authUsername.value.trim();
-            if (username.length < 3) return setAuthMsg('Vartotojo vardas turi būti bent 3 simbolių!', true);
-
-            await runBusy(authForm, async () => {
-                const { error } = await supabaseClient.auth.signUp({
-                    email,
-                    password,
-                    options: { data: { username } }
-                });
-                if (error) throw error;
-                await supabaseClient.auth.signOut();
-                startVerify(email);
-                setAuthMsg('Registracija sėkminga! Įveskite el. paštu gautą kodą.');
-            });
-        } else {
-            await runBusy(authForm, async () => {
-                const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
-                if (error) throw error;
-                initApp(data.user);
-            });
-        }
-    };
-}
-
-if (otpForm) {
-    otpForm.onsubmit = async (e) => {
-        e.preventDefault();
-        const token = otpCode.value.trim();
-        if (token.length !== 6) return setAuthMsg('Įveskite 6 skaitmenų kodą!', true);
-
-        await runBusy(otpForm, async () => {
-            const { error } = await supabaseClient.auth.verifyOtp({
-                email: pendingEmail,
-                token,
-                type: 'signup'
-            });
-            if (error) throw error;
-            setAuthMsg('El. paštas patvirtintas! Galite prisijungti.');
-            setTimeout(() => showAuthView('signin'), 1500);
-        });
-    };
-}
-
-if (logoutBtn) {
-    logoutBtn.onclick = async () => {
-        await supabaseClient.auth.signOut();
-        location.reload();
-    };
-}
-
-if (supabaseClient) {
-    supabaseClient.auth.getSession().then(({ data: { session } }) => {
-        if (session?.user) {
-            initApp(session.user);
-        } else {
-            if (authContainer) authContainer.classList.remove('hidden');
-        }
-    });
-}
-
-// PROGRAMOS PALEIDIMAS IR DUOMENŲ UŽKROVIMAS
-async function initApp(user) {
-    currentUserId = user.id;
-    if (authContainer) authContainer.classList.add('hidden');
-    if (appContainer) appContainer.classList.remove('hidden');
-    if (userEmailDisplay) userEmailDisplay.textContent = user.email;
-
-    if (!appStarted) {
-        appStarted = true;
-        initMaps();
-        setupUIEvents();
-        await loadProfiles();
-        await loadSavedHikes();
-        await loadPublicHikes();
+// Autentifikacijos langų perjungimas:
+// 'main' – prisijungimas/registracija, 'reset' – slaptažodžio atkūrimas, 'code' – 6 skaitmenų kodas
+function showAuthView(mode) {
+    authForm.classList.toggle('hidden', mode !== 'main');
+    resetForm.classList.toggle('hidden', mode !== 'reset');
+    codeForm.classList.toggle('hidden', mode !== 'code');
+    if (toggleRow) toggleRow.classList.toggle('hidden', mode !== 'main');
+    if (mode === 'reset') authTitle.textContent = 'Slaptažodžio atkūrimas';
+    else if (mode === 'code') authTitle.textContent = 'Patvirtinimo kodas';
+    else authTitle.textContent = isSignUpMode ? 'Registracija' : 'Prisijungimas';
+    setMsg(authMsg, ''); setMsg(resetMsg, ''); setMsg(codeMsg, '');
+    if (mode === 'code' && pendingVerify) {
+        const isRecovery = pendingVerify.type === 'recovery';
+        newPassGroup.classList.toggle('hidden', !isRecovery);
+        codeHint.textContent = isRecovery
+            ? `Kodas išsiųstas į ${pendingVerify.email}. Įveskite jį ir pasirinkite naują slaptažodį.`
+            : `Įveskite 6 skaitmenų kodą, atsiųstą į ${pendingVerify.email}, kad patvirtintumėte registraciją.`;
+        otpCode.value = '';
+        if (isRecovery) newPassword.value = '';
+        setTimeout(() => otpCode.focus(), 60);
     }
 }
 
-async function loadProfiles() {
-    try {
-        const { data, error } = await supabaseClient.from('profiles').select('id, username');
-        if (!error && data) {
-            data.forEach(p => userProfiles.set(p.id, p.username));
-        }
-    } catch (e) { console.error('Profilių klaida:', e); }
+// Autentifikacijos perjungimas
+if (toggleAuthBtn) {
+    toggleAuthBtn.onclick = (e) => {
+        e.preventDefault();
+        isSignUpMode = !isSignUpMode;
+        authTitle.textContent = isSignUpMode ? 'Registracija' : 'Prisijungimas';
+        authSubmitBtn.textContent = isSignUpMode ? 'Registruotis' : 'Prisijungti';
+        toggleAuthText.textContent = isSignUpMode ? 'Jau turite paskyrą?' : 'Neturite paskyros?';
+        toggleAuthBtn.textContent = isSignUpMode ? 'Prisijungti' : 'Registruotis';
+    };
 }
 
-function getUsername(userId) {
-    return userProfiles.get(userId) || ('zygininkas_' + String(userId).substring(0, 6));
+// Prisijungimo / Registracijos formos pateikimas
+if (authForm) {
+    authForm.onsubmit = async (e) => {
+        e.preventDefault();
+        setMsg(authMsg, '');
+        const email = authEmail.value.trim();
+        const password = authPassword.value;
+        authSubmitBtn.disabled = true;
+        const oldLabel = authSubmitBtn.textContent;
+        authSubmitBtn.textContent = 'Palaukite…';
+        try {
+            if (isSignUpMode) {
+                const { data, error } = await supabaseClient.auth.signUp({ email, password });
+                if (error) {
+                    setMsg(authMsg, 'Registracijos klaida: ' + translateAuthError(error), 'err');
+                    return;
+                }
+                if (data.session && data.user) {
+                    // El. pašto patvirtinimas išjungtas – prijungiame iškart
+                    setRememberFlag(rememberChk.checked);
+                    initApp(data.user);
+                    return;
+                }
+                // Reikia patvirtinti el. paštą – lauksime 6 skaitmenų kodo
+                setRememberFlag(true);
+                pendingVerify = { email, type: 'signup' };
+                showAuthView('code');
+            } else {
+                // Varnelę nustatome PRIEŠ prisijungimą – nuo jos priklauso, kur atsiras sesija
+                setRememberFlag(rememberChk.checked);
+                const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
+                if (error) {
+                    setMsg(authMsg, 'Prisijungimo klaida: ' + translateAuthError(error), 'err');
+                    return;
+                }
+                if (data.user) initApp(data.user);
+            }
+        } finally {
+            authSubmitBtn.disabled = false;
+            authSubmitBtn.textContent = oldLabel;
+        }
+    };
+}
+
+// Slaptažodžio atkūrimas: išsiunčiame 6 skaitmenų PIN kodą be localhost nuorodų
+if (forgotBtn) forgotBtn.onclick = (e) => { e.preventDefault(); showAuthView('reset'); };
+if (resetBackBtn) resetBackBtn.onclick = () => showAuthView('main');
+
+if (resetForm) {
+    resetForm.onsubmit = async (e) => {
+        e.preventDefault();
+        setMsg(resetMsg, '');
+        const email = resetEmail.value.trim();
+        resetSubmitBtn.disabled = true;
+        resetSubmitBtn.textContent = 'Siunčiama…';
+
+        // NAUDOJAME signInWithOtp - tai privers Supabase išsiųsti TIK 6 skaitmenų kodą
+        const { error } = await supabaseClient.auth.signInWithOtp({
+            email: email,
+            options: {
+                shouldCreateUser: false // Neleis kurti naujos paskyros, jei el. paštas nerastas
+            }
+        });
+
+        resetSubmitBtn.disabled = false;
+        resetSubmitBtn.textContent = 'Siųsti kodą';
+
+        if (error) {
+            setMsg(resetMsg, 'Klaida: ' + translateAuthError(error), 'err');
+            return;
+        }
+
+        setRememberFlag(true);
+        pendingVerify = { email, type: 'recovery' };
+        showAuthView('code'); // Perkelia į kodo įvedimo laukelį
+    };
+}
+
+// Sena sesija atkuriama automatiškai perkraunant puslapį (veikia kartu su „Prisiminti mane“)
+if (supabaseClient) {
+    supabaseClient.auth.getSession().then(({ data }) => {
+        if (data && data.session && data.session.user) initApp(data.session.user);
+    }).catch(() => {});
 }
 
 function createMap(id) {
-    const m = L.map(id, { zoomControl: false }).setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+    const m = L.map(id, {
+        zoomControl: false,
+        renderer: L.canvas({ tolerance: 14 })
+    }).setView(DEFAULT_CENTER, DEFAULT_ZOOM);
     L.tileLayer(TILE_URL, TILE_OPTIONS).addTo(m);
     L.control.zoom({ position: 'topright' }).addTo(m);
     return m;
 }
 
-function initMaps() {
-    map = createMap('map');
-    mapHistory = createMap('map-history');
-    mapSocial = createMap('map-social');
+const colorPalette = document.getElementById('colorPalette');
+const customColorInput = document.getElementById('customColor');
+const lineNameInput = document.getElementById('lineName');
+const lineSelect = document.getElementById('lineSelect');
+const gpsDrawBtn = document.getElementById('gpsDrawBtn');
+const statsPanel = document.getElementById('statsPanel');
+const historyEmpty = document.getElementById('history-empty');
+
+const infoCard = document.getElementById('info-card');
+const cardTitle = document.getElementById('card-title');
+const cardDot = document.getElementById('card-dot');
+const cardDuration = document.getElementById('card-duration');
+const cardDistance = document.getElementById('card-distance');
+const cardSpeed = document.getElementById('card-speed');
+const cardElevation = document.getElementById('card-elevation');
+const cardDate = document.getElementById('card-date');
+const closeBtn = document.getElementById('close-btn');
+
+let selectedPoly = null;
+function styleGroup(g, sel) {
+    g.eachLayer(l => { if (l._base) l.setStyle({ weight: l._base + (sel ? 3 : 0), opacity: sel ? 1 : 0.92 }); });
+}
+function clearSelection() {
+    if (selectedPoly) { styleGroup(selectedPoly, false); selectedPoly = null; }
+}
+function closeCard() {
+    infoCard.classList.add('hidden');
+    document.querySelectorAll('.act-item.selected').forEach(el => el.classList.remove('selected'));
+    clearSelection();
+}
+if (closeBtn) closeBtn.onclick = closeCard;
+
+let cardLine = null;
+
+// Kilometrų tarpiniai laikai (reikia taškų laiko žymų – turi tik nauji įrašai)
+function computeSplits(line) {
+    const p = line.points;
+    if (!p || p.length < 2 || p.some(q => q.length < 3)) return [];
+    const cum = [0];
+    for (let i = 1; i < p.length; i++) cum.push(cum[i - 1] + L.latLng(p[i - 1]).distanceTo(L.latLng(p[i])));
+    const f = line.distance > 0 && cum[cum.length - 1] > 0 ? line.distance / cum[cum.length - 1] : 1;
+    const D = cum.map(x => x * f), total = D[D.length - 1];
+    const out = []; let prevT = p[0][2], k = 1, j = 1;
+    while (k * 1000 <= total) {
+        while (j < D.length - 1 && D[j] < k * 1000) j++;
+        const r = (k * 1000 - D[j - 1]) / ((D[j] - D[j - 1]) || 1);
+        const t = p[j - 1][2] + (p[j][2] - p[j - 1][2]) * r;
+        out.push({ km: k, sec: t - prevT, dist: 1000 });
+        prevT = t; k++;
+    }
+    const rem = total - (k - 1) * 1000;
+    if (rem >= 100) out.push({ km: k, sec: p[p.length - 1][2] - prevT, dist: rem, partial: true });
+    return out.filter(x => x.sec > 0);
 }
 
-// DUOMENŲ IŠSAUGOJIMAS IR UŽKROVIMAS IŠ SUPABASE
-async function loadSavedHikes() {
-    const { data, error } = await supabaseClient.from('zygiai').select('*').eq('user_id', currentUserId);
-    if (error) { console.error('Klaida kraunant žygius:', error.message); return; }
-    
-    linesData = (data || []).map(item => ({
-        id: item.id,
-        user_id: item.user_id,
-        name: item.pavadinimas || item.title || 'Žygis',
-        color: item.spalva || item.color || '#384a31',
-        points: item.koordinates || item.coordinates || [],
-        distance: item.atstumas ? parseFloat(item.atstumas) : (item.distance || 0),
-        duration: item.laikas ? parseTimeToSec(item.laikas) : (item.duration || 0),
-        elevationGain: item.elevationGain || 0,
-        is_public: !!item.is_public,
-        date: item.created_at ? new Date(item.created_at).toLocaleDateString('lt-LT') : '-'
-    }));
-
-    renderHistoryPolylines();
+function renderSplits(line) {
+    const box = document.getElementById('card-splits');
+    const sp = computeSplits(line);
+    if (!sp.length) { box.innerHTML = ''; return; }
+    const a = ACTIVITIES[line.activity] || ACTIVITIES.walk;
+    const paces = sp.map(x => x.sec / (x.dist / 1000)), best = Math.min(...paces);
+    box.innerHTML = `<div class="split-head"><span>Km</span><span>${a.pace ? 'Tempas' : 'Greitis'}</span></div>` +
+        sp.map((x, i) => `<div class="split"><span class="sk">${x.partial ? (x.dist / 1000).toFixed(2) : x.km}</span>
+            <span class="sbar"><i style="width:${(30 + 70 * best / paces[i]).toFixed(0)}%"></i></span>
+            <b>${fmtSpeedFor(line.activity, x.dist / x.sec)}</b></div>`).join('');
 }
 
-async function loadPublicHikes() {
-    const { data, error } = await supabaseClient.from('zygiai').select('*').eq('is_public', true);
-    if (error) return;
-
-    publicLinesData = (data || []).map(item => ({
-        id: item.id,
-        user_id: item.user_id,
-        name: item.pavadinimas || item.title || 'Viešas žygis',
-        color: item.spalva || item.color || '#10b981',
-        points: item.koordinates || item.coordinates || [],
-        distance: item.atstumas ? parseFloat(item.atstumas) : (item.distance || 0),
-        duration: item.laikas ? parseTimeToSec(item.laikas) : (item.duration || 0),
-        is_public: true
-    }));
-
-    renderSocialMap();
-    renderUsersList();
+function exportGpx(line) {
+    const p = line.points || [];
+    const hasT = p.length && p.every(q => q.length >= 3);
+    const base = line.startedAt && /^\d{4}-\d{2}-\d{2}$/.test(line.date) ? new Date(`${line.date}T${line.startedAt}:00`) : null;
+    const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const pts = p.map(q => `<trkpt lat="${q[0]}" lon="${q[1]}">${base && hasT ? `<time>${new Date(base.getTime() + (q[2] - p[0][2]) * 1000).toISOString()}</time>` : ''}</trkpt>`).join('');
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="GPS Žygio Žemėlapis" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>${esc(line.name)}</name><type>${line.activity}</type><trkseg>${pts}</trkseg></trk></gpx>`;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([xml], { type: 'application/gpx+xml' }));
+    a.download = `${line.name.replace(/[^\w\-ąčęėįšųūžĄČĘĖĮŠŲŪŽ ]+/g, '').trim() || 'marsrutas'}.gpx`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+function showRouteCard(line, poly, opts) {
+    clearSelection();
+    cardLine = line;
+    cardLine.isReadOnly = !!(opts && opts.readOnly);
+    const delBtn = document.getElementById('card-delete');
+    const renBtn = document.getElementById('card-rename');
+    if (delBtn) delBtn.style.display = cardLine.isReadOnly ? 'none' : '';
+    if (renBtn) renBtn.style.display = cardLine.isReadOnly ? 'none' : '';
+    if (poly) {
+        selectedPoly = poly;
+        styleGroup(poly, true);
+        poly.bringToFront();
+    }
+    const a = ACTIVITIES[line.activity] || ACTIVITIES.walk;
+    cardTitle.textContent = line.name;
+    cardDot.style.background = line.color;
+    cardDot.innerHTML = iconSvg(line.activity, 18);
+    cardDuration.textContent = formatTime(line.duration || 0);
+    cardDistance.textContent = formatDist(line.distance || 0);
+    document.getElementById('card-speed-label').textContent = a.pace ? 'Vid. tempas' : 'Vid. greitis';
+    cardSpeed.textContent = line.duration > 0 && line.distance > 0 ? fmtSpeedFor(line.activity, line.distance / line.duration) : '--';
+    cardElevation.textContent = `${Math.round(line.elevationGain || 0)} m`;
+    renderSplits(line);
+    cardDate.textContent = `${a.label} · ${whenText(line)}`;
+    document.querySelectorAll('.act-item').forEach(el => el.classList.toggle('selected', +el.dataset.id === line.id));
+    const item = document.querySelector(`.act-item[data-id="${line.id}"]`);
+    if (item && document.getElementById('history-list').classList.contains('open')) item.scrollIntoView({ block: 'nearest' });
+    infoCard.classList.remove('hidden');
 }
 
-async function isaugotiISupabase(lineData) {
-    const sharePublicInput = document.getElementById('sharePublic');
-    const isPublic = sharePublicInput ? sharePublicInput.checked : false;
+// „Mano veikla“ sąrašas atsiranda tik paspaudus mygtuką arba maršrutą
+function setDrawer(open) {
+    const list = document.getElementById('history-list');
+    list.classList.toggle('open', open);
+    document.getElementById('openActBtn').classList.toggle('hidden', open);
+    document.documentElement.style.setProperty('--drawer-h', open ? list.offsetHeight + 'px' : '0px');
+}
 
-    const payload = {
-        user_id: currentUserId,
-        pavadinimas: lineData.name,
-        spalva: lineData.color,
-        koordinates: lineData.points,
-        atstumas: formatDist(lineData.distance),
-        laikas: formatTime(lineData.duration),
-        greitis: fmtSpeedFor('walk', lineData.duration > 0 ? lineData.distance / lineData.duration : 0),
-        is_public: isPublic
-    };
+// Skilčių perjungimas
+const navItems = document.querySelectorAll('.nav-item');
+const tabContents = document.querySelectorAll('.tab-content');
 
-    try {
-        const { data, error } = await supabaseClient.from('zygiai').insert([payload]).select();
-        if (error) throw error;
+function switchTab(tabName, onReady) {
+    navItems.forEach(nav => nav.classList.toggle('active', nav.getAttribute('data-tab') === tabName));
+    tabContents.forEach(tab => tab.classList.remove('active'));
+    document.getElementById(`tab-${tabName}`).classList.add('active');
+    closeCard();
+    setDrawer(false);
+    setSocialDrawer(false);
 
-        alert('Žygis sėkmingai išsaugotas!');
-        await loadSavedHikes();
-        await loadPublicHikes();
-        return true;
-    } catch (err) {
-        console.error('Klaida išsaugant:', err);
-        alert('Išsaugoti nepavyko: ' + err.message);
-        return false;
+    if (tabName === 'record') {
+        setTimeout(() => { map && map.invalidateSize(); syncPanel(); if (onReady) onReady(); }, 50);
+    } else if (tabName === 'history') {
+        if (!mapHistory) {
+            mapHistory = createMap('map-history');
+            mapHistory.setView(map.getCenter(), map.getZoom());
+            mapHistory.on('click', () => { closeCard(); setDrawer(false); });
+        }
+        setTimeout(() => {
+            mapHistory.invalidateSize({ pan: false });
+            renderHistoryPolylines();
+            if (onReady) onReady();
+        }, 50);
+    } else if (tabName === 'social') {
+        if (!mapSocial) {
+            mapSocial = createMap('map-social');
+            mapSocial.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+            mapSocial.on('click', () => { closeCard(); setSocialDrawer(false); });
+        }
+        setTimeout(async () => {
+            mapSocial.invalidateSize({ pan: false });
+            await loadSocialHikes();
+            if (onReady) onReady();
+        }, 50);
+    } else if (onReady) {
+        onReady();
     }
 }
 
-function parseTimeToSec(str) {
-    if (!str || typeof str !== 'string') return 0;
-    const parts = str.split(':').map(Number);
-    if (parts.length === 2) return parts[0] * 60 + parts[1];
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    return 0;
+navItems.forEach(item => {
+    item.onclick = () => switchTab(item.getAttribute('data-tab'));
+});
+
+// Spalvų paletė
+colors.forEach((color, i) => {
+    const swatch = document.createElement('div');
+    swatch.className = `color-swatch ${i === 0 ? 'selected' : ''}`;
+    swatch.style.backgroundColor = color;
+    swatch.onclick = () => {
+        document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('selected'));
+        swatch.classList.add('selected');
+        selectedColor = color;
+        customColorInput.value = color;
+    };
+    if (colorPalette) colorPalette.appendChild(swatch);
+});
+
+if (customColorInput) {
+    customColorInput.oninput = (e) => {
+        selectedColor = e.target.value;
+        document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('selected'));
+    };
 }
 
 const formatTime = (sec) => {
@@ -377,209 +497,834 @@ const formatTime = (sec) => {
 
 const formatDist = (m) => m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
 
-// ŽEMĖLAPIŲ ATVAIZDAVIMAS
+const calcDist = (pts) => {
+    let d = 0;
+    for (let i = 0; i < pts.length - 1; i++) {
+        d += L.latLng(pts[i]).distanceTo(L.latLng(pts[i + 1]));
+    }
+    return d;
+};
+
+// DB eilutė -> programos objektas.
+// Lentelės „zygiai“ stulpeliai: pavadinimas, koordinates, spalva, atstumas,
+// trukme, kilimas, laikas, tipas, user_id
+function mapZygisRow(item, authorEmail) {
+    return {
+        id: item.id,
+        name: item.pavadinimas || 'Maršrutas',
+        color: item.spalva || '#2563eb',
+        points: item.koordinates || [],
+        distance: Number(item.atstumas) || 0,
+        duration: Number(item.trukme) || 0,
+        elevationGain: Number(item.kilimas) || 0,
+        date: (item.laikas || '-').split('|')[0],
+        startedAt: (item.laikas || '').split('|')[1] || '',
+        endedAt: (item.laikas || '').split('|')[2] || '',
+        activity: item.tipas || getTypeMap()[item.id] || 'walk',
+        authorEmail: authorEmail || '',
+        userId: item.user_id || null
+    };
+}
+
+// Supabase duomenų sinchronizacija – į „Buvę“ skiltį kraunami tik SAVO žygiai
+async function uzkrautiIsSupabase() {
+    let { data, error } = await supabaseClient.from('zygiai').select('*')
+        .or(`user_id.is.null,user_id.eq.${currentUser.id}`)
+        .order('id', { ascending: true });
+
+    // Jei lentelėje dar nėra „user_id“ stulpelio – krauname viską, kaip anksčiau
+    if (error && /user_id/i.test(error.message || '')) {
+        ({ data, error } = await supabaseClient.from('zygiai').select('*').order('id', { ascending: true }));
+    }
+    if (error) { console.error('Klaida kraunant:', error.message); return; }
+    if (data) {
+        linesData = data.map(item => mapZygisRow(item));
+        updateSelects();
+        checkDraft();
+    }
+}
+
+// Neišsaugotų žygių eilė: jei serveris buvo nepasiekiamas, žygis lieka šiame įrenginyje
+// ir automatiškai išsiunčiamas kitą kartą atsidarius puslapį
+const PENDING_KEY = 'zygiaiNeisiustaEile';
+function queuePendingSave(line) {
+    try {
+        const arr = JSON.parse(localStorage.getItem(PENDING_KEY) || '[]');
+        arr.push(JSON.parse(JSON.stringify(line)));
+        localStorage.setItem(PENDING_KEY, JSON.stringify(arr));
+    } catch (e) {}
+}
+async function retryPendingSaves() {
+    let arr = [];
+    try { arr = JSON.parse(localStorage.getItem(PENDING_KEY) || '[]'); } catch (e) {}
+    if (!arr.length) return;
+    const remaining = [];
+    for (const item of arr) {
+        const ok = await isaugotiISupabase(item);
+        if (ok) {
+            if (item.points && item.points.length > 1) {
+                const idx = item.id != null ? linesData.findIndex(x => x.id === item.id) : -1;
+                if (idx >= 0) linesData[idx] = item; else linesData.push(item);
+            }
+        } else {
+            remaining.push(item);
+        }
+    }
+    try { localStorage.setItem(PENDING_KEY, JSON.stringify(remaining)); } catch (e) {}
+    updateSelects();
+    if (mapHistory) renderHistoryPolylines();
+    if (!remaining.length) alert('Anksčiau neišsiųsti žygiai sėkmingai išsaugoti serveryje.');
+}
+
+// Naujas žygis -> INSERT, tęsiamas -> UPDATE.
+// Lentelės „zygiai“ stulpeliai: pavadinimas, koordinates, spalva, atstumas, trukme,
+// kilimas, laikas, tipas, user_id.
+// Jei kurio stulpelio dar nėra (pvz. neįvykdytas supabase-setup.sql) – jis automatiškai
+// šalinamas iš užklausos, kad žygis VIS DĒL TO būtų išsaugotas.
+async function isaugotiISupabase(line) {
+    const { data: { user }, error: userErr } = await supabaseClient.auth.getUser();
+    if (userErr || !user) return false;
+
+    let payload = {
+        pavadinimas: line.name,
+        koordinates: line.points,
+        spalva: line.color,
+        atstumas: Math.round(line.distance),
+        trukme: Math.round(line.duration),
+        kilimas: Math.round(line.elevationGain || 0),
+        laikas: encodeDate(line),
+        tipas: line.activity,
+        user_id: user.id
+    };
+
+    const send = (p) => line.isNew
+        ? supabaseClient.from('zygiai').insert([p]).select()
+        : supabaseClient.from('zygiai').update(p).eq('id', line.id).select();
+
+    let res = await send(payload);
+    for (let i = 0; i < 4 && res.error; i++) {
+        const msg = res.error.message || '';
+        // PGRST204 – stulpelio dar nėra lentelėje: šaliname jį ir bandome dar kartą
+        const col = msg.match(/'([A-Za-z_]+)'/);
+        if ((res.error.code === 'PGRST204' || /Could not find the .* column/i.test(msg)) && col && payload[col[1]] !== undefined) {
+            delete payload[col[1]];
+            res = await send(payload);
+            continue;
+        }
+        // Atsarginis variantas, jei „laikas“ stulpelis būtų SQL datos tipo
+        if (/invalid input syntax/i.test(msg) && /date|timestamp/i.test(msg)) {
+            payload.laikas = line.date;
+            res = await send(payload);
+            continue;
+        }
+        break;
+    }
+
+    // UPDATE nepaveikė nė vienos eilutės (senas įrašas be savininko / RLS) – sukuriam savo kopiją
+    if (!res.error && !line.isNew && (!res.data || !res.data.length)) {
+        line.isNew = true;
+        res = await supabaseClient.from('zygiai').insert([payload]).select();
+    }
+
+    if (res.error || !res.data || !res.data.length) {
+        lastSaveError = res.error ? `${res.error.code || ''} ${res.error.message}`.trim() : 'Serveris negrąžino įrašo.';
+        console.error('Klaida išsaugant:', lastSaveError);
+        return false;
+    }
+    line.id = res.data[0].id;
+    line.isNew = false;
+    setLocalType(line.id, line.activity);
+    return true;
+}
+
+async function istrintiIsSupabase(id) {
+    const { error } = await supabaseClient.from('zygiai').delete().eq('id', id);
+    if (error) console.error('Klaida trinant:', error.message);
+}
+
+// Įrašymo žemėlapyje piešiamas tik šiuo metu įrašomas maršrutas
+function createRecordingPolyline(line) {
+    return L.polyline(line.points, { color: line.color, weight: LINE_WEIGHT, opacity: 0.85 }).addTo(map);
+}
+
+const OVERLAP_CELL = 8;   // m – tinklelio ląstelė persidengimams aptikti
+
 function renderHistoryPolylines() {
     if (!mapHistory) return;
-    historyPolylineMap.forEach(p => mapHistory.removeLayer(p));
+    selectedPoly = null;
+    if (historyHalo) { mapHistory.removeLayer(historyHalo); historyHalo = null; }
+    historyPolylineMap.forEach(g => mapHistory.removeLayer(g));
     historyPolylineMap.clear();
 
-    const bounds = L.latLngBounds();
-    linesData.forEach(line => {
-        if (!line.points || line.points.length < 2) return;
-        const poly = L.polyline(line.points, { color: line.color, weight: LINE_WEIGHT }).addTo(mapHistory);
-        historyPolylineMap.set(line.id, poly);
-        bounds.extend(poly.getBounds());
+    const lines = linesData.filter(l => l.points && l.points.length > 1);
+    historyEmpty.classList.toggle('hidden', lines.length > 0);
+    if (!lines.length) { renderHistoryList(); return; }
+
+    // 1) Kiek skirtingų maršrutų eina per kiekvieną vietą (spalvos nesvarbios)
+    const dLat = OVERLAP_CELL / 111320;
+    const dLng = OVERLAP_CELL / (111320 * Math.cos(lines[0].points[0][0] * Math.PI / 180));
+    const cells = new Map();
+    lines.forEach(l => {
+        for (let i = 0; i < l.points.length - 1; i++) {
+            const a = l.points[i], b = l.points[i + 1];
+            const steps = Math.max(1, Math.ceil(L.latLng(a).distanceTo(L.latLng(b)) / 4));
+            for (let k = 0; k <= steps; k++) {
+                const la = a[0] + (b[0] - a[0]) * k / steps, ln = a[1] + (b[1] - a[1]) * k / steps;
+                const key = Math.floor(la / dLat) + ',' + Math.floor(ln / dLng);
+                if (!cells.has(key)) cells.set(key, new Set());
+                cells.get(key).add(l.id);
+            }
+        }
+    });
+    const countAt = (la, ln) => {
+        const cx = Math.floor(la / dLat), cy = Math.floor(ln / dLng), u = new Set();
+        for (let x = -1; x <= 1; x++) for (let y = -1; y <= 1; y++) {
+            const s = cells.get((cx + x) + ',' + (cy + y));
+            if (s) s.forEach(id => u.add(id));
+        }
+        return u.size;
+    };
+
+    // 2) Kiekvienas maršrutas dalijamas į ruožus, storis pagal kartų skaičių
+    const halos = [], built = [];
+    lines.forEach(l => {
+        const p = l.points, m = p.length - 1;
+        const raw = [];
+        for (let i = 0; i < m; i++) raw.push(countAt((p[i][0] + p[i + 1][0]) / 2, (p[i][1] + p[i + 1][1]) / 2));
+        const cnt = raw.map((_, i) => Math.max(raw[i - 1] || 1, raw[i], raw[i + 1] || 1));
+        const layers = [];
+        let start = 0;
+        for (let i = 0; i < m; i++) {
+            if (i === m - 1 || cnt[i + 1] !== cnt[i]) {
+                const seg = p.slice(start, i + 2);
+                const w = 4 + Math.min(cnt[i] - 1, 4) * 1.5;
+                const pl = L.polyline(seg, { color: l.color, weight: w, opacity: 0.92, lineCap: 'round', lineJoin: 'round' });
+                pl._base = w;
+                layers.push(pl);
+                if (cnt[i] > 1) halos.push(L.polyline(seg, { color: '#fff', weight: w + 3, opacity: 0.75, interactive: false }));
+                start = i + 1;
+            }
+        }
+        built.push({ l, layers });
     });
 
-    if (linesData.length > 0 && bounds.isValid()) {
-        mapHistory.fitBounds(bounds, { padding: [30, 30] });
-    }
+    historyHalo = L.featureGroup(halos).addTo(mapHistory);
+    built.forEach(({ l, layers }) => {
+        const g = L.featureGroup(layers).addTo(mapHistory);
+        g.on('click', (e) => { L.DomEvent.stopPropagation(e); showRouteCard(l, g); });
+        historyPolylineMap.set(l.id, g);
+    });
     renderHistoryList();
 }
 
-function renderSocialMap() {
-    if (!mapSocial) return;
-    socialPolylineMap.forEach(p => mapSocial.removeLayer(p));
-    socialPolylineMap.clear();
-
-    const empty = document.getElementById('social-empty');
-    if (empty) empty.classList.toggle('hidden', publicLinesData.length > 0);
-
-    const bounds = L.latLngBounds();
-    publicLinesData.forEach(line => {
-        if (!line.points || line.points.length < 2) return;
-        const poly = L.polyline(line.points, { color: line.color, weight: LINE_WEIGHT }).addTo(mapSocial);
-        socialPolylineMap.set(line.id, poly);
-        bounds.extend(poly.getBounds());
-    });
-
-    if (publicLinesData.length > 0 && bounds.isValid()) {
-        mapSocial.fitBounds(bounds, { padding: [30, 30] });
-    }
-}
-
-function renderUsersList() {
-    const usersList = document.getElementById('usersList');
-    if (!usersList) return;
-
-    usersList.innerHTML = '';
-    const userCounts = new Map();
-
-    publicLinesData.forEach(line => {
-        const uid = line.user_id;
-        userCounts.set(uid, (userCounts.get(uid) || 0) + 1);
-    });
-
-    if (userCounts.size === 0) {
-        usersList.innerHTML = '<div style="font-size:12px; color:var(--muted);">Nėra viešų žygių</div>';
-        return;
-    }
-
-    userCounts.forEach((count, uid) => {
-        const name = getUsername(uid);
-        const row = document.createElement('div');
-        row.className = 'user-row';
-        row.innerHTML = `
-            <div class="avatar">${name.charAt(0).toUpperCase()}</div>
-            <div style="flex:1;">${name}</div>
-            <div style="font-size:11px; color:var(--muted);">${count} žyg.</div>
-        `;
-        row.onclick = () => filterSocialByUser(uid);
-        usersList.appendChild(row);
-    });
-}
-
-function filterSocialByUser(uid) {
-    const userLines = publicLinesData.filter(l => l.user_id === uid);
-    const bounds = L.latLngBounds();
-    userLines.forEach(l => {
-        const poly = socialPolylineMap.get(l.id);
-        if (poly) bounds.extend(poly.getBounds());
-    });
-    if (bounds.isValid()) mapSocial.fitBounds(bounds, { padding: [40, 40] });
+function thumbSvg(pts, color) {
+    if (!pts || pts.length < 2) return '';
+    const step = Math.ceil(pts.length / 120);
+    const p = pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
+    const lats = p.map(x => x[0]), lngs = p.map(x => x[1]);
+    const minLa = Math.min(...lats), maxLa = Math.max(...lats), minLn = Math.min(...lngs), maxLn = Math.max(...lngs);
+    const kx = Math.cos(((minLa + maxLa) / 2) * Math.PI / 180);
+    const w = Math.max((maxLn - minLn) * kx, 1e-9), hgt = Math.max(maxLa - minLa, 1e-9);
+    const sc = Math.min(60 / w, 44 / hgt);
+    const ox = (76 - w * sc) / 2, oy = (60 - hgt * sc) / 2;
+    const d = p.map(x => `${(ox + (x[1] - minLn) * kx * sc).toFixed(1)},${(oy + (maxLa - x[0]) * sc).toFixed(1)}`).join(' ');
+    return `<svg class="act-thumb" viewBox="0 0 76 60"><polyline points="${d}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
 
 function renderHistoryList() {
     const box = document.getElementById('history-items');
     if (!box) return;
+    const sum = document.getElementById('history-summary');
+    if (sum) {
+        const monday = new Date(); monday.setHours(0, 0, 0, 0);
+        monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+        const wk = { n: 0, d: 0, t: 0 }, all = { n: 0, d: 0, t: 0 };
+        linesData.forEach(l => {
+            all.n++; all.d += l.distance || 0; all.t += l.duration || 0;
+            const dt = new Date((l.date || '') + 'T00:00:00');
+            if (!isNaN(dt) && dt >= monday) { wk.n++; wk.d += l.distance || 0; wk.t += l.duration || 0; }
+        });
+        const cell = (title, o) => `<div><small>${title}</small><b>${formatDist(o.d)}</b><span>${formatTime(o.t)} · ${o.n} veikl.</span></div>`;
+        sum.innerHTML = cell('Ši savaitė', wk) + cell('Iš viso', all);
+    }
     box.innerHTML = '';
-
     [...linesData].reverse().forEach(line => {
-        const el = document.createElement('div');
+        if (!line.points || line.points.length < 2) return;
+        const a = ACTIVITIES[line.activity] || ACTIVITIES.walk;
+        const el = document.createElement('button');
         el.className = 'act-item';
-        el.style.padding = '10px';
-        el.style.borderBottom = '1px solid var(--line)';
-        el.innerHTML = `
-            <div style="font-weight:700; color:var(--ink);">${line.name}</div>
-            <div style="font-size:12px; color:var(--muted);">${line.date} · ${formatDist(line.distance)} · ${formatTime(line.duration)}</div>
-        `;
+        el.dataset.id = line.id;
+        const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        el.innerHTML = `${thumbSvg(line.points, line.color)}
+            <div class="act-info">
+                <div class="act-title">${iconSvg(line.activity, 16)}<span>${esc(line.name)}</span></div>
+                <div class="act-date">${esc(whenText(line))} · ${a.label}</div>
+                <div class="act-stats">
+                    <div><small>Atstumas</small><b>${formatDist(line.distance || 0)}</b></div>
+                    <div><small>Trukmė</small><b>${formatTime(line.duration || 0)}</b></div>
+                    <div><small>Sukilimas</small><b>${Math.round(line.elevationGain || 0)} m</b></div>
+                </div>
+            </div>`;
+        el.onclick = () => {
+            const poly = historyPolylineMap.get(line.id);
+            if (!poly) return;
+            mapHistory.fitBounds(poly.getBounds(), { padding: [40, 40], maxZoom: 17 });
+            showRouteCard(line, poly);
+        };
         box.appendChild(el);
     });
 }
 
-// GPS ĮRAŠYMAS
-function setupUIEvents() {
-    const navItems = document.querySelectorAll('.nav-item');
-    navItems.forEach(item => {
-        item.onclick = () => {
-            const tab = item.dataset.tab;
-            navItems.forEach(n => n.classList.remove('active'));
-            item.classList.add('active');
+const fitAllBtn = document.getElementById('fitAllBtn');
+if (fitAllBtn) {
+    fitAllBtn.onclick = () => {
+        if (!mapHistory) return;
+        const all = L.latLngBounds([]);
+        historyPolylineMap.forEach(poly => all.extend(poly.getBounds()));
+        if (all.isValid()) mapHistory.fitBounds(all, { padding: [60, 60], maxZoom: 17 });
+    };
+}
 
-            document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
-            const target = document.getElementById(`tab-${tab}`);
-            if (target) target.classList.add('active');
+// ================== SOCIALINĖ SKILTIS ==================
+let mapSocial = null;
+const socialPolylineMap = new Map();
+let socialLines = [];
 
-            setTimeout(() => {
-                if (tab === 'record' && map) map.invalidateSize();
-                if (tab === 'history' && mapHistory) mapHistory.invalidateSize();
-                if (tab === 'social' && mapSocial) mapSocial.invalidateSize();
-            }, 200);
-        };
+function setSocialDrawer(open) {
+    const list = document.getElementById('social-list');
+    if (!list) return;
+    list.classList.toggle('open', open);
+    const btn = document.getElementById('openSocialBtn');
+    if (btn) btn.classList.toggle('hidden', open);
+    document.documentElement.style.setProperty('--drawer-h', open ? list.offsetHeight + 'px' : '0px');
+}
+
+// Kraunami KITŲ vartotojų žygiai
+async function loadSocialHikes() {
+    if (!supabaseClient || !currentUser) return;
+    const itemsBox = document.getElementById('social-items');
+    const emptyBox = document.getElementById('social-empty');
+    if (!itemsBox || !emptyBox) return;
+
+    let data = null, error = null;
+    // Bandome gauti ir autoriaus el. paštą (veikia įvykdžius supabase-setup.sql)
+    ({ data, error } = await supabaseClient.from('zygiai')
+        .select('*, author:profiles(email)')
+        .neq('user_id', currentUser.id)
+        .order('id', { ascending: false })
+        .limit(100));
+    if (error && /profiles|relationship/i.test(error.message || '')) {
+        // Jei profilių lentelės/FK dar nėra – krauname be autoriaus vardo
+        ({ data, error } = await supabaseClient.from('zygiai')
+            .select('*')
+            .neq('user_id', currentUser.id)
+            .order('id', { ascending: false })
+            .limit(100));
+    }
+    if (error) {
+        if (/user_id/i.test(error.message || '')) {
+            emptyBox.textContent = 'Socialinei skilčiai reikia atnaujinti duomenų bazę – Supabase SQL Editor įvykdykite supabase-setup.sql scenarijų.';
+            emptyBox.classList.remove('hidden');
+            itemsBox.innerHTML = '';
+            socialLines = [];
+            renderSocialPolylines();
+            return;
+        }
+        console.error('Klaida kraunant socialinius žygius:', error.message);
+        return;
+    }
+    socialLines = (data || []).map(item => mapZygisRow(item, item.author && item.author.email));
+    emptyBox.textContent = 'Dar nėra kitų vartotojų išsaugotų žygių';
+    emptyBox.classList.toggle('hidden', socialLines.some(l => l.points && l.points.length > 1));
+    renderSocialPolylines();
+
+    // Automatiškai prideriname žemėlapį prie visų maršrutų
+    const all = L.latLngBounds([]);
+    socialPolylineMap.forEach(g => all.extend(g.getBounds()));
+    if (all.isValid()) mapSocial.fitBounds(all, { padding: [50, 50], maxZoom: 15 });
+}
+
+function renderSocialPolylines() {
+    if (!mapSocial) return;
+    socialPolylineMap.forEach(g => mapSocial.removeLayer(g));
+    socialPolylineMap.clear();
+
+    const lines = socialLines.filter(l => l.points && l.points.length > 1);
+    lines.forEach(l => {
+        const g = L.featureGroup([
+            L.polyline(l.points, { color: l.color, weight: LINE_WEIGHT, opacity: 0.9, lineCap: 'round', lineJoin: 'round' })
+        ]).addTo(mapSocial);
+        g.eachLayer(pl => { pl._base = LINE_WEIGHT; });
+        g.on('click', (e) => {
+            L.DomEvent.stopPropagation(e);
+            showRouteCard(l, g, { readOnly: true });
+        });
+        socialPolylineMap.set(l.id, g);
     });
+    renderSocialList();
+}
 
-    const toggleUsersBtn = document.getElementById('toggleUsersBtn');
-    const usersMenu = document.getElementById('usersMenu');
-    if (toggleUsersBtn && usersMenu) {
-        toggleUsersBtn.onclick = () => usersMenu.classList.toggle('hidden');
-    }
-
-    const gpsDrawBtn = document.getElementById('gpsDrawBtn');
-    const stopBtn = document.getElementById('stopBtn');
-    const setupView = document.getElementById('setupView');
-    const statsPanel = document.getElementById('statsPanel');
-
-    if (gpsDrawBtn) {
-        gpsDrawBtn.onclick = () => {
-            if (!isGpsRecording) {
-                isGpsRecording = true;
-                const nameInput = document.getElementById('lineName');
-                currentLineData = {
-                    name: (nameInput && nameInput.value.trim()) || 'Žygis ' + new Date().toLocaleDateString('lt-LT'),
-                    color: selectedColor,
-                    points: [],
-                    distance: 0,
-                    duration: 0
-                };
-
-                setupView.classList.add('hidden');
-                statsPanel.classList.remove('hidden');
-
-                totalElapsed = 0;
-                timerInterval = setInterval(() => {
-                    totalElapsed++;
-                    currentLineData.duration = totalElapsed;
-                    document.getElementById('statTime').textContent = formatTime(totalElapsed);
-                }, 1000);
-
-                if ('geolocation' in navigator) {
-                    watchId = navigator.geolocation.watchPosition(
-                        (pos) => {
-                            const lat = pos.coords.latitude;
-                            const lng = pos.coords.longitude;
-                            const pt = [lat, lng];
-
-                            if (currentLineData.points.length > 0) {
-                                const lastPt = currentLineData.points[currentLineData.points.length - 1];
-                                currentLineData.distance += L.latLng(lastPt).distanceTo(L.latLng(pt));
-                            }
-
-                            currentLineData.points.push(pt);
-
-                            if (!currentPolyline) {
-                                currentPolyline = L.polyline(currentLineData.points, { color: selectedColor, weight: LINE_WEIGHT }).addTo(map);
-                            } else {
-                                currentPolyline.setLatLngs(currentLineData.points);
-                            }
-
-                            map.setView(pt, 16);
-                            document.getElementById('statDistance').textContent = formatDist(currentLineData.distance);
-                        },
-                        (err) => console.error(err),
-                        { enableHighAccuracy: true }
-                    );
-                }
-            }
+function renderSocialList() {
+    const box = document.getElementById('social-items');
+    if (!box) return;
+    box.innerHTML = '';
+    const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    socialLines.forEach(line => {
+        if (!line.points || line.points.length < 2) return;
+        const a = ACTIVITIES[line.activity] || ACTIVITIES.walk;
+        const el = document.createElement('button');
+        el.className = 'act-item soc-item';
+        el.innerHTML = `${thumbSvg(line.points, line.color)}
+            <div class="act-info">
+                <div class="act-title">${iconSvg(line.activity, 16)}<span>${esc(line.name)}</span></div>
+                <div class="act-date"><span class="soc-author">${esc(line.authorEmail || 'Kitas vartotojas')}</span> · ${esc(whenText(line))} · ${a.label}</div>
+                <div class="act-stats">
+                    <div><small>Atstumas</small><b>${formatDist(line.distance || 0)}</b></div>
+                    <div><small>Trukmė</small><b>${formatTime(line.duration || 0)}</b></div>
+                    <div><small>Sukilimas</small><b>${Math.round(line.elevationGain || 0)} m</b></div>
+                </div>
+            </div>`;
+        el.onclick = () => {
+            const poly = socialPolylineMap.get(line.id);
+            if (!poly) return;
+            mapSocial.fitBounds(poly.getBounds(), { padding: [40, 40], maxZoom: 17 });
+            showRouteCard(line, poly, { readOnly: true });
         };
+        box.appendChild(el);
+    });
+}
+
+const fitAllSocialBtn = document.getElementById('fitAllSocialBtn');
+if (fitAllSocialBtn) {
+    fitAllSocialBtn.onclick = () => {
+        if (!mapSocial) return;
+        const all = L.latLngBounds([]);
+        socialPolylineMap.forEach(poly => all.extend(poly.getBounds()));
+        if (all.isValid()) mapSocial.fitBounds(all, { padding: [60, 60], maxZoom: 17 });
+    };
+}
+const openSocialBtn = document.getElementById('openSocialBtn');
+if (openSocialBtn) openSocialBtn.onclick = () => setSocialDrawer(true);
+const closeSocialBtn = document.getElementById('closeSocialBtn');
+if (closeSocialBtn) closeSocialBtn.onclick = () => { setSocialDrawer(false); closeCard(); };
+// ================ /SOCIALINĖ SKILTIS ==================
+
+document.getElementById('openActBtn').onclick = () => setDrawer(true);
+document.getElementById('closeActBtn').onclick = () => { setDrawer(false); closeCard(); };
+
+const autoChk = document.getElementById('autoPauseChk');
+try { autoChk.checked = localStorage.getItem('autoPause') !== '0'; } catch (e) {}
+autoChk.onchange = () => { autoPauseOn = autoChk.checked; try { localStorage.setItem('autoPause', autoChk.checked ? '1' : '0'); } catch (e) {} };
+
+const toggleMoreBtn = document.getElementById('toggleMoreBtn');
+toggleMoreBtn.onclick = () => { document.getElementById('moreOpts').classList.toggle('hidden'); syncPanel(); };
+
+// Veiklos tipo pasirinkimas
+const activityRow = document.getElementById('activityRow');
+Object.keys(ACTIVITIES).forEach(key => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'act-chip' + (key === selectedActivity ? ' active' : '');
+    b.innerHTML = `${iconSvg(key, 22)}<span>${ACTIVITIES[key].label}</span>`;
+    b.onclick = () => {
+        selectedActivity = key;
+        activityRow.querySelectorAll('.act-chip').forEach(c => c.classList.remove('active'));
+        b.classList.add('active');
+    };
+    activityRow.appendChild(b);
+});
+
+// Skydelio aukštis -> žemėlapio atribucija nepaslepiama
+const recordPanel = document.getElementById('recordPanel');
+function syncPanel() {
+    document.documentElement.style.setProperty('--panel-h', recordPanel.offsetHeight + 'px');
+}
+if (window.ResizeObserver) new ResizeObserver(syncPanel).observe(recordPanel);
+syncPanel();
+
+document.querySelectorAll('input[name="lineOption"]').forEach(r => {
+    r.onchange = (e) => { lineSelect.classList.toggle('hidden', e.target.value !== 'continue'); syncPanel(); };
+});
+
+function updateSelects() {
+    if (!lineSelect) return;
+    lineSelect.innerHTML = '';
+    linesData.forEach(l => lineSelect.add(new Option(l.name, l.id)));
+}
+
+// GPS Įrašymo logika
+if (gpsDrawBtn) {
+    gpsDrawBtn.onclick = () => startGps();
+    document.getElementById('stopBtn').onclick = () => stopGps(true);
+    document.getElementById('pauseBtn').onclick = () => {
+        if (!isGpsRecording) return;
+        updateStats();
+        if (isPaused || autoPaused) {
+            isPaused = false; autoPaused = false;
+            lastTick = Date.now(); lastMoveTime = Date.now(); lastFix = null; lastAny = null;
+        } else {
+            isPaused = true;
+        }
+        refreshPauseUI(); updateStats(); saveDraft();
+    };
+}
+
+async function acquireWakeLock() {
+    try {
+        if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+    } catch (e) { /* nepalaikoma – ignoruojame */ }
+}
+function releaseWakeLock() {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+// Grįžus į programėlę ekrano užraktas atnaujinamas
+const GPS_OPTS = { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 };
+const DRAFT_KEY = 'zygiaiDraft';
+
+function saveDraft() {
+    if (!isGpsRecording || !currentLineData) return;
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ line: currentLineData, paused: isPaused, savedAt: Date.now() })); } catch (e) {}
+}
+function clearDraft() { try { localStorage.removeItem(DRAFT_KEY); } catch (e) {} }
+
+document.addEventListener('visibilitychange', () => {
+    if (!isGpsRecording) return;
+    if (document.visibilityState === 'hidden') { saveDraft(); return; }
+    // Grįžus į programėlę: atnaujiname ekrano užraktą, GPS stebėjimą ir laikmatį
+    acquireWakeLock();
+    navigator.geolocation.clearWatch(watchId);
+    watchId = navigator.geolocation.watchPosition(onGps, onGpsError, GPS_OPTS);
+    updateStats();
+});
+window.addEventListener('pagehide', saveDraft);
+
+// Nebaigto įrašymo atkūrimas (jei naršyklė užmigdė ar uždarė puslapį)
+async function checkDraft() {
+    let d = null;
+    try { d = JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null'); } catch (e) {}
+    if (!d || !d.line) return;
+    const l = d.line;
+    const fresh = Date.now() - d.savedAt < 6 * 3600 * 1000;
+    if (fresh && confirm(`Rastas nebaigtas įrašas „${l.name}“. Tęsti įrašymą?\n\n(Atšaukus jis bus išsaugotas toks, koks yra.)`)) {
+        startGps(d);
+        return;
     }
-
-    if (stopBtn) {
-        stopBtn.onclick = async () => {
-            if (isGpsRecording) {
-                isGpsRecording = false;
-                clearInterval(timerInterval);
-                if (watchId) navigator.geolocation.clearWatch(watchId);
-
-                await isaugotiISupabase(currentLineData);
-
-                if (currentPolyline) {
-                    map.removeLayer(currentPolyline);
-                    currentPolyline = null;
-                }
-
-                statsPanel.classList.add('hidden');
-                setupView.classList.remove('hidden');
-            }
-        };
+    clearDraft();
+    if (l.points && l.points.length > 1 && l.distance >= 10) {
+        if (l.startedAt) l.endedAt = hm(new Date(d.savedAt));
+        const ok = await isaugotiISupabase(l);
+        if (!ok) queuePendingSave(l);
+        const idx = l.id != null ? linesData.findIndex(x => x.id === l.id) : -1;
+        if (idx >= 0) linesData[idx] = l; else linesData.push(l);
+        updateSelects();
+        if (mapHistory) renderHistoryPolylines();
     }
 }
+
+const median = (arr) => {
+    const s = [...arr].sort((a, b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+
+function defaultName(type) {
+    const h = new Date().getHours();
+    const part = h < 5 ? 'Naktinis' : h < 12 ? 'Rytinis' : h < 18 ? 'Popietinis' : 'Vakarinis';
+    return `${part} ${ACTIVITIES[type].noun}`;
+}
+
+function refreshPauseUI() {
+    const act = ACTIVITIES[currentLineData && currentLineData.activity] || ACTIVITIES.walk;
+    document.getElementById('liveActivity').textContent = isPaused ? 'Pristabdyta' : autoPaused ? 'Automatinė pauzė' : `${act.label} · įrašoma`;
+    document.getElementById('pauseBtn').textContent = (isPaused || autoPaused) ? 'Tęsti' : 'Pauzė';
+    recordPanel.classList.toggle('paused', isPaused || autoPaused);
+}
+
+function startGps(resume) {
+    if (!('geolocation' in navigator)) return alert('GPS nepalaikomas');
+
+    closeCard();
+    const isContinue = document.querySelector('input[name="lineOption"]:checked').value === 'continue';
+
+    if (resume) {
+        currentLineData = resume.line;
+        selectedActivity = currentLineData.activity || selectedActivity;
+        totalElapsed = currentLineData.duration || 0;
+    } else if (isContinue) {
+        const id = parseInt(lineSelect.value);
+        currentLineData = linesData.find(l => l.id === id);
+        if (!currentLineData) return alert('Pasirinkite maršrutą');
+        currentLineData.color = selectedColor;
+        selectedActivity = currentLineData.activity || selectedActivity;
+        currentLineData.elevationGain = currentLineData.elevationGain || 0;
+        totalElapsed = currentLineData.duration || 0;
+    } else {
+        currentLineData = {
+            id: null, isNew: true,
+            activity: selectedActivity,
+            name: lineNameInput.value.trim() || defaultName(selectedActivity),
+            color: selectedColor, date: new Date().toLocaleDateString('lt-LT'), startedAt: hm(new Date()), endedAt: '',
+            distance: 0, duration: 0, elevationGain: 0, points: []
+        };
+        totalElapsed = 0;
+    }
+    const act = ACTIVITIES[currentLineData.activity] || ACTIVITIES.walk;
+    MAX_SPEED = act.maxSpeed; MIN_STEP = act.minStep;
+    document.getElementById('lblSpeed').textContent = act.pace ? 'Tempas' : 'Greitis';
+    document.getElementById('liveActivity').textContent = `${act.label} · įrašoma`;
+    currentPolyline = createRecordingPolyline(currentLineData);
+
+    // Išvalome filtrų būseną
+    lastFix = null; lastAny = null; rejectedInRow = 0;
+    if (resume && currentLineData.points.length) {
+        lastFix = { pt: currentLineData.points[currentLineData.points.length - 1], t: resume.savedAt };
+    }
+    curSpeed = 0; lastMoveTime = Date.now(); isPaused = false; autoPaused = false;
+    altWindow = []; smoothAlt = null; anchorAlt = null;
+
+    watchId = navigator.geolocation.watchPosition(onGps, onGpsError, GPS_OPTS);
+    activeMs = totalElapsed * 1000; lastTick = Date.now();
+    autoPauseOn = document.getElementById('autoPauseChk').checked;
+    if (resume) {   // laikas, praleistas užmigus ekranui, įskaičiuojamas (nebent buvo pauzė)
+        isPaused = !!resume.paused;
+        if (!isPaused) activeMs += Date.now() - resume.savedAt;
+    }
+    timerInterval = setInterval(updateStats, 1000);
+    acquireWakeLock();
+
+    isGpsRecording = true;
+    document.getElementById('setupView').classList.add('hidden');
+    statsPanel.classList.remove('hidden');
+    refreshPauseUI();
+    syncPanel();
+    updateStats();
+}
+
+function onGpsError(err) {
+    console.warn(err);
+    if (err.code === 1) {
+        alert('Nėra leidimo naudoti GPS. Leiskite vietos nustatymą naršyklės nustatymuose.');
+        stopGps(false);
+    }
+}
+
+// Aukščio kilimas: mediana + glotninimas + slenkstis (histerezė)
+function processAltitude(alt) {
+    altWindow.push(alt);
+    if (altWindow.length > 5) altWindow.shift();
+    const med = median(altWindow);
+    smoothAlt = smoothAlt === null ? med : smoothAlt + 0.3 * (med - smoothAlt);
+
+    if (anchorAlt === null) { anchorAlt = smoothAlt; return; }
+    const diff = smoothAlt - anchorAlt;
+    if (diff >= ELEV_THRESHOLD) {
+        currentLineData.elevationGain += diff;
+        anchorAlt = smoothAlt;
+    } else if (diff <= -ELEV_THRESHOLD) {
+        anchorAlt = smoothAlt;
+    }
+}
+
+function onGps(pos) {
+    if (!isGpsRecording || !currentLineData) return;
+
+    const { latitude: lat, longitude: lng, accuracy, speed, altitude, altitudeAccuracy } = pos.coords;
+    const t = pos.timestamp || Date.now();
+    const pt = [lat, lng];
+
+    // Vartotojo žymeklis rodomas visada, kad matytųsi GPS būklė
+    if (!userMarker) {
+        userMarker = L.circleMarker(pt, { radius: 8, fillColor: '#2563eb', color: '#fff', weight: 3, fillOpacity: 1 }).addTo(map);
+        accuracyCircle = L.circle(pt, { radius: accuracy, color: '#2563eb', fillOpacity: 0.1, weight: 1 }).addTo(map);
+    } else {
+        userMarker.setLatLng(pt);
+        accuracyCircle.setLatLng(pt).setRadius(accuracy);
+    }
+    map.setView(pt, map.getZoom());
+
+    // 1) Per prastas tikslumas – neįtraukiame į matavimus
+    if (!(accuracy <= MAX_ACCURACY)) return;
+
+    const sp = (typeof speed === 'number' && isFinite(speed) && speed >= 0) ? Math.min(speed, MAX_SPEED) : null;
+    const thr = (ACTIVITIES[currentLineData.activity] || ACTIVITIES.walk).pace ? 0.6 : 1.5;   // m/s – „stovi“ riba
+
+    if (isPaused) return;
+    if (autoPaused) {
+        const moving = sp !== null ? sp > thr * 1.5
+            : (lastFix ? L.latLng(lastFix.pt).distanceTo(L.latLng(pt)) > Math.max(MIN_STEP, accuracy) * 1.5 : true);
+        if (!moving) return;
+        autoPaused = false; lastTick = Date.now(); lastMoveTime = Date.now(); lastAny = null;
+        refreshPauseUI();
+    }
+
+    const pts = currentLineData.points;
+
+    // Atstumas pagal Doplerio greitį: GPS „speed“ yra daug tikslesnis nei taškų atstumų sumavimas,
+    // nes atstumus tarp „šokinėjančių“ taškų sumuojant kaupiasi zigzagų ilgis (+5–10 %)
+    let dopplerOk = false;
+    if (lastAny && sp !== null && lastAny.speed !== null) {
+        const dtA = (t - lastAny.t) / 1000;
+        if (dtA > 0 && dtA <= 30) {
+            const v = (sp + lastAny.speed) / 2;
+            if (v > 0.4) currentLineData.distance += v * dtA;   // žemiau 0,4 m/s – stovėjimas / triukšmas
+            dopplerOk = true;
+        }
+    }
+    lastAny = { t, speed: sp };
+    if (sp !== null && sp > thr) lastMoveTime = Date.now();
+
+    if (lastFix) {
+        const dt = (t - lastFix.t) / 1000;
+        if (dt <= 0) return;
+        const d = L.latLng(lastFix.pt).distanceTo(L.latLng(pt));
+
+        // 2) Vietoje stovėjimo GPS „šokinėja“ – judesys turi viršyti paklaidą
+        if (d < Math.max(MIN_STEP, accuracy)) return;
+
+        // 3) Neįmanomi šuoliai
+        if (d / dt > MAX_SPEED) {
+            rejectedInRow++;
+            if (rejectedInRow < 5) return;
+            // 5 iš eilės – tikriausiai signalas atsistatė kitoje vietoje; pradedame iš naujo be atstumo
+            lastFix = { pt, t };
+            pts.push([lat, lng, Math.round(activeNow() / 1000)]);
+            if (currentPolyline) currentPolyline.setLatLngs(pts);
+            rejectedInRow = 0;
+            return;
+        }
+        rejectedInRow = 0;
+
+        // Tarpas (pvz. užmigo ekranas) arba GPS neduoda greičio – naudojame atstumą tarp taškų
+        if (dt > 30 || !dopplerOk) currentLineData.distance += d;
+
+        // Dabartinis greitis (glotninamas)
+        const raw = (typeof speed === 'number' && isFinite(speed) && speed >= 0) ? speed : d / dt;
+        curSpeed = curSpeed === 0 ? raw : curSpeed * 0.6 + raw * 0.4;
+        lastMoveTime = Date.now();
+
+        // Aukštis skaičiuojamas tik kai realiai pajudėta ir aukščio tikslumas geras
+        if (typeof altitude === 'number' && isFinite(altitude) &&
+            (altitudeAccuracy == null || altitudeAccuracy <= MAX_ALT_ACCURACY)) {
+            processAltitude(altitude);
+        }
+    } else if (typeof altitude === 'number' && isFinite(altitude) &&
+               (altitudeAccuracy == null || altitudeAccuracy <= MAX_ALT_ACCURACY)) {
+        processAltitude(altitude);
+    }
+
+    lastFix = { pt, t };
+    pts.push([lat, lng, Math.round(activeNow() / 1000)]);
+    if (currentPolyline) currentPolyline.setLatLngs(pts);
+    updateStats();
+}
+
+function updateStats() {
+    if (!isGpsRecording || !currentLineData) return;
+    const now = Date.now();
+    if (!isPaused && !autoPaused) activeMs += now - lastTick;
+    lastTick = now;
+
+    // Automatinė pauzė: ilgai nejudama
+    if (autoPauseOn && !isPaused && !autoPaused && lastFix && now - lastMoveTime > AUTO_PAUSE_DELAY) {
+        autoPaused = true;
+        activeMs = Math.max(0, activeMs - AUTO_PAUSE_DELAY);   // nejudėjimo laikas neįskaičiuojamas
+        refreshPauseUI();
+    }
+
+    totalElapsed = Math.floor(activeMs / 1000);
+    currentLineData.duration = totalElapsed;
+    if (totalElapsed % 5 === 0) saveDraft();
+
+    // Nejudant / pauzės metu greitis 0
+    if (isPaused || autoPaused || now - lastMoveTime > STILL_TIMEOUT) curSpeed = 0;
+
+    document.getElementById('statTime').textContent = formatTime(totalElapsed);
+    document.getElementById('statDistance').textContent = formatDist(currentLineData.distance);
+    document.getElementById('statSpeed').textContent = fmtSpeedFor(currentLineData.activity, curSpeed);
+    document.getElementById('statElevation').textContent = `${Math.round(currentLineData.elevationGain || 0)} m`;
+}
+
+async function stopGps(save = true) {
+    if (!isGpsRecording) return;
+    updateStats();
+    isGpsRecording = false;
+    clearDraft();
+    navigator.geolocation.clearWatch(watchId);
+    clearInterval(timerInterval);
+    releaseWakeLock();
+
+    document.getElementById('setupView').classList.remove('hidden');
+    lineNameInput.value = '';
+
+    if (userMarker) { map.removeLayer(userMarker); userMarker = null; }
+    if (accuracyCircle) { map.removeLayer(accuracyCircle); accuracyCircle = null; }
+    statsPanel.classList.add('hidden');
+    syncPanel();
+
+    // Maršrutas išimamas iš „Įrašymo“ žemėlapio – jis priklauso skilčiai „Buvę“
+    if (currentPolyline) { map.removeLayer(currentPolyline); currentPolyline = null; }
+
+    const line = currentLineData;
+    currentLineData = null;
+    lastFix = null;
+
+    if (!save || !line) { updateSelects(); return; }
+
+    // Per trumpas / tuščias įrašas nesaugomas
+    if (line.points.length < 2 || line.distance < 10) {
+        if (line.isNew) alert('Maršrutas per trumpas, todėl neišsaugotas.');
+        updateSelects();
+        return;
+    }
+
+    line.duration = Math.round(totalElapsed);
+    if (line.startedAt) line.endedAt = hm(new Date());
+    const wasNew = line.isNew;
+    const ok = await isaugotiISupabase(line);
+    if (wasNew && !linesData.includes(line)) linesData.push(line);
+    updateSelects();
+    if (mapHistory) renderHistoryPolylines();
+
+    if (!ok) {
+        // Žygis NEIŠNYKSTA: išsaugome jį įrenginyje ir automatiškai bandysime išsiųsti vėliau
+        queuePendingSave(line);
+        alert(`Nepavyko išsaugoti žygio serveryje.\n\nKlaida: ${lastSaveError || 'nežinoma'}\n\nŽygis išsaugotas šiame įrenginyje – programa automatiškai bandys jį išsiųsti, kitą kartą atsidarius puslapį.`);
+        return;
+    }
+
+    // Perkeliame į skiltį „Buvę“ ir parodome ką tik baigtą žygį
+    switchTab('history', () => {
+        const poly = historyPolylineMap.get(line.id);
+        if (poly && mapHistory) {
+            mapHistory.fitBounds(poly.getBounds(), { padding: [60, 60], maxZoom: 17 });
+            showRouteCard(line, poly);
+        }
+    });
+}
+
+async function deleteLine(id) {
+    if (isGpsRecording && currentLineData && currentLineData.id === id) await stopGps(false);
+    linesData = linesData.filter(l => l.id !== id);
+    await istrintiIsSupabase(id);
+    updateSelects();
+    closeCard();
+    if (mapHistory) renderHistoryPolylines();
+}
+
+const cardGpxBtn = document.getElementById('card-gpx');
+if (cardGpxBtn) cardGpxBtn.onclick = () => { if (cardLine) exportGpx(cardLine); };
+const cardRenameBtn = document.getElementById('card-rename');
+if (cardRenameBtn) cardRenameBtn.onclick = async () => {
+    if (!cardLine || cardLine.isReadOnly) return;
+    const n = prompt('Naujas pavadinimas', cardLine.name);
+    if (!n || !n.trim()) return;
+    cardLine.name = n.trim().slice(0, 60);
+    cardTitle.textContent = cardLine.name;
+    await isaugotiISupabase(cardLine);
+    renderHistoryList();
+    document.querySelectorAll('.act-item').forEach(el => el.classList.toggle('selected', +el.dataset.id === cardLine.id));
+};
+const cardDeleteBtn = document.getElementById('card-delete');
+if (cardDeleteBtn) cardDeleteBtn.onclick = () => {
+    if (cardLine && !cardLine.isReadOnly && confirm(`Ištrinti „${cardLine.name}“?`)) deleteLine(cardLine.id);
+};
