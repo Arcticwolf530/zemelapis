@@ -104,6 +104,12 @@ input:focus, select:focus { border-color: var(--accent); }
 .gps-btn { width: 100%; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 14px; font-size: 15px; font-weight: 700; cursor: pointer; }
 .gps-btn:active { background: #1a5ccc; }
 .gps-btn.stop { background: var(--ink); margin-top: 14px; }
+.gps-btn.pause { background: #5b6472; margin-top: 8px; }
+.gps-btn.pause:active { background: #454c58; }
+
+/* Automatinės pauzės varnelė */
+.chk-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
+.chk-row input { width: 16px; height: 16px; accent-color: var(--accent); flex: none; }
 
 /* ---------- Įrašymo statistika ---------- */
 .live-top { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 10px; }

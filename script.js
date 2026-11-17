@@ -23,6 +23,16 @@ const authStorage = {
     }
 };
 
+// Ar puslapis atidarytas per slaptažodžio atkūrimo nuorodą iš el. laiško?
+// Tokios nuorodos hash atrodo taip: #access_token=...&refresh_token=...&type=recovery
+const URL_IS_RECOVERY = (() => {
+    try {
+        const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+        const query = new URLSearchParams(window.location.search);
+        return hash.get('type') === 'recovery' || query.get('type') === 'recovery';
+    } catch (e) { return false; }
+})();
+
 let supabaseClient = null;
 if (window.supabase) {
     supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -30,7 +40,8 @@ if (window.supabase) {
             storage: authStorage,       // „Prisiminti mane“ logika
             persistSession: true,
             autoRefreshToken: true,
-            detectSessionInUrl: false   // naudojame 6 skaitmenų kodus, o ne nuorodas laiškuose
+            detectSessionInUrl: true,   // apdorojame nuorodą iš laiško
+            flowType: 'implicit'        // laiškų nuorodos turi tokenus hash'e (#...&type=recovery)
         }
     });
 }
@@ -142,6 +153,7 @@ const toggleRow = document.getElementById('toggleRow');
 let isSignUpMode = false;
 let currentUser = null;      // prisijungęs vartotojas
 let pendingVerify = null;    // laukiantis patvirtinimas { email, type: 'signup' | 'recovery' }
+let recoveryPending = false; // true – ateita per slaptažodžio atkūrimo nuorodą, dar nesame prisijungę
 let lastSaveError = '';      // paskutinė serverio klaida – rodome vartotojui
 
 function setRememberFlag(on) {
@@ -186,13 +198,18 @@ function showAuthView(mode) {
     setMsg(authMsg, ''); setMsg(resetMsg, ''); setMsg(codeMsg, '');
     if (mode === 'code' && pendingVerify) {
         const isRecovery = pendingVerify.type === 'recovery';
+        const skipOtp = !!pendingVerify.skipOtp;   // atkūrimas per nuorodą – 6 skaitmenų kodo nereikia
         newPassGroup.classList.toggle('hidden', !isRecovery);
-        codeHint.textContent = isRecovery
-            ? `Kodas išsiųstas į ${pendingVerify.email}. Įveskite jį ir pasirinkite naują slaptažodį.`
-            : `Įveskite 6 skaitmenų kodą, atsiųstą į ${pendingVerify.email}, kad patvirtintumėte registraciją.`;
+        // Paslepiame 6 skaitmenų kodo lauką, jei atkūrimas ateina per nuorodą
+        if (otpCode) otpCode.classList.toggle('hidden', skipOtp);
+        codeHint.textContent = skipOtp
+            ? `Įveskite naują slaptažodį sąskaitai ${pendingVerify.email}.`
+            : (isRecovery
+                ? `Kodas išsiųstas į ${pendingVerify.email}. Įveskite jį ir pasirinkite naują slaptažodį.`
+                : `Įveskite 6 skaitmenų kodą, atsiųstą į ${pendingVerify.email}, kad patvirtintumėte registraciją.`);
         otpCode.value = '';
         if (isRecovery) newPassword.value = '';
-        setTimeout(() => otpCode.focus(), 60);
+        setTimeout(() => (skipOtp && newPassword ? newPassword.focus() : otpCode.focus()), 60);
     }
 }
 
@@ -252,10 +269,9 @@ if (authForm) {
     };
 }
 
-// Slaptažodžio atkūrimas: išsiunčiame 6 skaitmenų PIN kodą be localhost nuorodų
+// Slaptažodžio atkūrimas, 1 žingsnis: išsiunčiame 6 skaitmenų kodą į el. paštą
 if (forgotBtn) forgotBtn.onclick = (e) => { e.preventDefault(); showAuthView('reset'); };
 if (resetBackBtn) resetBackBtn.onclick = () => showAuthView('main');
-
 if (resetForm) {
     resetForm.onsubmit = async (e) => {
         e.preventDefault();
@@ -263,32 +279,163 @@ if (resetForm) {
         const email = resetEmail.value.trim();
         resetSubmitBtn.disabled = true;
         resetSubmitBtn.textContent = 'Siunčiama…';
-
-        // NAUDOJAME signInWithOtp - tai privers Supabase išsiųsti TIK 6 skaitmenų kodą
-        const { error } = await supabaseClient.auth.signInWithOtp({
-            email: email,
-            options: {
-                shouldCreateUser: false // Neleis kurti naujos paskyros, jei el. paštas nerastas
-            }
-        });
-
+        const { error } = await supabaseClient.auth.resetPasswordForEmail(email);
         resetSubmitBtn.disabled = false;
         resetSubmitBtn.textContent = 'Siųsti kodą';
-
         if (error) {
             setMsg(resetMsg, 'Klaida: ' + translateAuthError(error), 'err');
             return;
         }
-
         setRememberFlag(true);
         pendingVerify = { email, type: 'recovery' };
-        showAuthView('code'); // Perkelia į kodo įvedimo laukelį
+        showAuthView('code');
     };
 }
 
+// Kodo patvirtinimas: registracijos užbaigimas ARBA naujo slaptažodžio nustatymas
+if (codeForm) {
+    codeForm.onsubmit = async (e) => {
+        e.preventDefault();
+        if (!pendingVerify) return;
+        setMsg(codeMsg, '');
+
+        // Atkūrimas per nuorodą iš laiško – sesija jau gauta, 6 skaitmenų kodo nereikia
+        if (pendingVerify.skipOtp) {
+            const np0 = newPassword.value;
+            if (np0.length < 6) {
+                setMsg(codeMsg, 'Slaptažodis per trumpas – mažiausiai 6 simboliai.', 'err');
+                return;
+            }
+            codeSubmitBtn.disabled = true;
+            codeSubmitBtn.textContent = 'Išsaugoma…';
+            const { error: upErr0 } = await supabaseClient.auth.updateUser({ password: np0 });
+            if (upErr0) {
+                codeSubmitBtn.disabled = false;
+                codeSubmitBtn.textContent = 'Patvirtinti';
+                setMsg(codeMsg, 'Nepavyko nustatyti slaptažodžio: ' + translateAuthError(upErr0), 'err');
+                return;
+            }
+            pendingVerify = null;
+            recoveryPending = false;
+            const { data: sess } = await supabaseClient.auth.getSession();
+            if (sess && sess.session && sess.session.user) initApp(sess.session.user);
+            return;
+        }
+
+        const token = otpCode.value.replace(/\D/g, '');
+        if (token.length !== 6) {
+            setMsg(codeMsg, 'Įveskite visus 6 skaitmenis.', 'err');
+            return;
+        }
+        codeSubmitBtn.disabled = true;
+        codeSubmitBtn.textContent = 'Tikrinama…';
+        const { data, error } = await supabaseClient.auth.verifyOtp({
+            email: pendingVerify.email,
+            token: token,
+            type: pendingVerify.type
+        });
+        if (error) {
+            codeSubmitBtn.disabled = false;
+            codeSubmitBtn.textContent = 'Patvirtinti';
+            setMsg(codeMsg, 'Kodas neteisingas arba pasibaigęs: ' + translateAuthError(error), 'err');
+            return;
+        }
+        if (pendingVerify.type === 'recovery') {
+            const np = newPassword.value;
+            if (np.length < 6) {
+                codeSubmitBtn.disabled = false;
+                codeSubmitBtn.textContent = 'Patvirtinti';
+                setMsg(codeMsg, 'Slaptažodis per trumpas – mažiausiai 6 simboliai.', 'err');
+                return;
+            }
+            const { error: upErr } = await supabaseClient.auth.updateUser({ password: np });
+            if (upErr) {
+                codeSubmitBtn.disabled = false;
+                codeSubmitBtn.textContent = 'Patvirtinti';
+                setMsg(codeMsg, 'Nepavyko nustatyti slaptažodžio: ' + translateAuthError(upErr), 'err');
+                return;
+            }
+        }
+        pendingVerify = null;
+        if (data && data.user) initApp(data.user);
+    };
+    if (codeBackBtn) codeBackBtn.onclick = () => { pendingVerify = null; showAuthView('main'); };
+    if (resendBtn) {
+        resendBtn.onclick = async () => {
+            if (!pendingVerify) return;
+            resendBtn.disabled = true;
+            let err = null;
+            if (pendingVerify.type === 'signup') {
+                ({ error: err } = await supabaseClient.auth.resend({ type: 'signup', email: pendingVerify.email }));
+            } else {
+                ({ error: err } = await supabaseClient.auth.resetPasswordForEmail(pendingVerify.email));
+            }
+            resendBtn.disabled = false;
+            if (err) setMsg(codeMsg, 'Nepavyko išsiųsti kodo: ' + translateAuthError(err), 'err');
+            else setMsg(codeMsg, 'Naujas kodas išsiųstas. Patikrinkite ir aplanką „Spam“.');
+        };
+    }
+}
+
+if (logoutBtn) {
+    logoutBtn.onclick = async () => {
+        await supabaseClient.auth.signOut();
+        try { localStorage.removeItem(REMEMBER_KEY); sessionStorage.removeItem(REMEMBER_KEY); } catch (e) {}
+        location.reload();
+    };
+}
+
+function initApp(user) {
+    currentUser = user;
+    authContainer.classList.add('hidden');
+    appContainer.classList.remove('hidden');
+    userEmailDisplay.textContent = user.email;
+
+    // Žemėlapis kuriamas tik VIENĄ kartą (po slaptažodžio atkūrimo initApp kviečiamas antrą kartą)
+    if (map) return;
+    map = createMap('map');
+    map.on('click', closeCard);
+    uzkrautiIsSupabase().then(() => retryPendingSaves());
+}
+
+// Slaptažodžio atkūrimo ekranas: AIŠKIAI parodome auth langą ir paslepiame programą.
+// Būtina, nes po nuorodos Supabase sesiją sukuria dar PRIEŠ PASSWORD_RECOVERY įvykį,
+// o be šito initApp „uždengia“ atkūrimo langą ir vartotojas iškart metamas į programą.
+function showRecoveryScreen(user) {
+    recoveryPending = true;
+    pendingVerify = { email: (user && user.email) || '', type: 'recovery', skipOtp: true };
+    authContainer.classList.remove('hidden');
+    appContainer.classList.add('hidden');
+    showAuthView('code');
+}
+
+// URL išvalymas nuo atkūrimo tokenų, kad jie liktų adreso juostoje / istorijoje
+function cleanRecoveryUrl() {
+    try { window.history.replaceState({}, '', window.location.pathname + window.location.search); } catch (e) {}
+}
+
 // Sena sesija atkuriama automatiškai perkraunant puslapį (veikia kartu su „Prisiminti mane“)
+// Taip pat apdorojame slaptažodžio atkūrimo nuorodą iš el. laiško (PASSWORD_RECOVERY įvykis)
 if (supabaseClient) {
+    supabaseClient.auth.onAuthStateChange((event, session) => {
+        if (event === 'PASSWORD_RECOVERY' && session && session.user) {
+            if (recoveryPending) return;   // ekranas jau parodytas – nevalome vartotojo įvesties
+            cleanRecoveryUrl();
+            showRecoveryScreen(session.user);
+        }
+    });
     supabaseClient.auth.getSession().then(({ data }) => {
+        if (URL_IS_RECOVERY) {
+            // Puslapis atidarytas per atkūrimo nuorodą – NIEKU nerodome programos
+            cleanRecoveryUrl();
+            if (data && data.session && data.session.user) {
+                if (!recoveryPending) showRecoveryScreen(data.session.user);
+            } else {
+                showAuthView('main');
+                setMsg(authMsg, 'Nuoroda slaptažodžio atkūrimui nebegalioja arba jau panaudota. Prašykite naujos per „Pamiršau slaptažodį“.', 'err');
+            }
+            return;
+        }
         if (data && data.session && data.session.user) initApp(data.session.user);
     }).catch(() => {});
 }
@@ -360,6 +507,7 @@ function computeSplits(line) {
 
 function renderSplits(line) {
     const box = document.getElementById('card-splits');
+    if (!box) return;
     const sp = computeSplits(line);
     if (!sp.length) { box.innerHTML = ''; return; }
     const a = ACTIVITIES[line.activity] || ACTIVITIES.walk;
@@ -807,35 +955,41 @@ async function loadSocialHikes() {
     if (!itemsBox || !emptyBox) return;
 
     let data = null, error = null;
-    // Bandome gauti ir autoriaus el. paštą (veikia įvykdžius supabase-setup.sql)
+    // Krauname VISUS žygius (be SQL filtravimo) – „neq“ SQL nemato eilučių su tuščiu
+    // user_id, todėl seni žygiai dings iš socialinės skilties. Filtruojame čia, kode.
     ({ data, error } = await supabaseClient.from('zygiai')
         .select('*, author:profiles(email)')
-        .neq('user_id', currentUser.id)
         .order('id', { ascending: false })
         .limit(100));
     if (error && /profiles|relationship/i.test(error.message || '')) {
         // Jei profilių lentelės/FK dar nėra – krauname be autoriaus vardo
         ({ data, error } = await supabaseClient.from('zygiai')
             .select('*')
-            .neq('user_id', currentUser.id)
             .order('id', { ascending: false })
             .limit(100));
     }
     if (error) {
-        if (/user_id/i.test(error.message || '')) {
-            emptyBox.textContent = 'Socialinei skilčiai reikia atnaujinti duomenų bazę – Supabase SQL Editor įvykdykite supabase-setup.sql scenarijų.';
-            emptyBox.classList.remove('hidden');
-            itemsBox.innerHTML = '';
-            socialLines = [];
-            renderSocialPolylines();
-            return;
-        }
         console.error('Klaida kraunant socialinius žygius:', error.message);
+        emptyBox.textContent = 'Nepavyko įkelti žygių: ' + (error.message || 'nežinoma klaida');
+        emptyBox.classList.remove('hidden');
+        itemsBox.innerHTML = '';
+        socialLines = [];
+        renderSocialPolylines();
         return;
     }
-    socialLines = (data || []).map(item => mapZygisRow(item, item.author && item.author.email));
-    emptyBox.textContent = 'Dar nėra kitų vartotojų išsaugotų žygių';
-    emptyBox.classList.toggle('hidden', socialLines.some(l => l.points && l.points.length > 1));
+    const allRows = data || [];
+    // Savų žygių čia nerodome; įrašai be savininko (seni) irgi rodomi kaip „kitų“
+    socialLines = allRows
+        .filter(item => !item.user_id || item.user_id !== currentUser.id)
+        .map(item => mapZygisRow(item, item.author && item.author.email));
+    if (socialLines.length === 0) {
+        emptyBox.textContent = allRows.length === 0
+            ? 'Duomenų bazėje dar nėra jokių išsaugotų žygių.'
+            : 'Kitų vartotojų žygių dar nėra – visi ' + allRows.length + ' duomenų bazės žygiai priklauso jums. Kitų vartotojų žygiai čia atsiras, kai jie juos įrašys.';
+        emptyBox.classList.remove('hidden');
+    } else {
+        emptyBox.classList.add('hidden');
+    }
     renderSocialPolylines();
 
     // Automatiškai prideriname žemėlapį prie visų maršrutų
@@ -913,8 +1067,8 @@ document.getElementById('openActBtn').onclick = () => setDrawer(true);
 document.getElementById('closeActBtn').onclick = () => { setDrawer(false); closeCard(); };
 
 const autoChk = document.getElementById('autoPauseChk');
-try { autoChk.checked = localStorage.getItem('autoPause') !== '0'; } catch (e) {}
-autoChk.onchange = () => { autoPauseOn = autoChk.checked; try { localStorage.setItem('autoPause', autoChk.checked ? '1' : '0'); } catch (e) {} };
+try { if (autoChk) autoChk.checked = localStorage.getItem('autoPause') !== '0'; } catch (e) {}
+if (autoChk) autoChk.onchange = () => { autoPauseOn = autoChk.checked; try { localStorage.setItem('autoPause', autoChk.checked ? '1' : '0'); } catch (e) {} };
 
 const toggleMoreBtn = document.getElementById('toggleMoreBtn');
 toggleMoreBtn.onclick = () => { document.getElementById('moreOpts').classList.toggle('hidden'); syncPanel(); };
@@ -956,7 +1110,8 @@ function updateSelects() {
 if (gpsDrawBtn) {
     gpsDrawBtn.onclick = () => startGps();
     document.getElementById('stopBtn').onclick = () => stopGps(true);
-    document.getElementById('pauseBtn').onclick = () => {
+    const pauseBtnEl = document.getElementById('pauseBtn');
+    if (pauseBtnEl) pauseBtnEl.onclick = () => {
         if (!isGpsRecording) return;
         updateStats();
         if (isPaused || autoPaused) {
@@ -1036,7 +1191,8 @@ function defaultName(type) {
 function refreshPauseUI() {
     const act = ACTIVITIES[currentLineData && currentLineData.activity] || ACTIVITIES.walk;
     document.getElementById('liveActivity').textContent = isPaused ? 'Pristabdyta' : autoPaused ? 'Automatinė pauzė' : `${act.label} · įrašoma`;
-    document.getElementById('pauseBtn').textContent = (isPaused || autoPaused) ? 'Tęsti' : 'Pauzė';
+    const pauseBtnEl = document.getElementById('pauseBtn');
+    if (pauseBtnEl) pauseBtnEl.textContent = (isPaused || autoPaused) ? 'Tęsti' : 'Pauzė';
     recordPanel.classList.toggle('paused', isPaused || autoPaused);
 }
 
@@ -1084,7 +1240,8 @@ function startGps(resume) {
 
     watchId = navigator.geolocation.watchPosition(onGps, onGpsError, GPS_OPTS);
     activeMs = totalElapsed * 1000; lastTick = Date.now();
-    autoPauseOn = document.getElementById('autoPauseChk').checked;
+    const apChk = document.getElementById('autoPauseChk');
+    autoPauseOn = apChk ? apChk.checked : true;
     if (resume) {   // laikas, praleistas užmigus ekranui, įskaičiuojamas (nebent buvo pauzė)
         isPaused = !!resume.paused;
         if (!isPaused) activeMs += Date.now() - resume.savedAt;

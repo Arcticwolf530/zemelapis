@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="lt">
 <head>
@@ -104,6 +105,7 @@
                 <div id="setupView">
                     <div id="activityRow" class="act-row"></div>
                     <input type="text" id="lineName" placeholder="Pavadinimas (nebūtina)">
+                    <label class="chk-row"><input type="checkbox" id="autoPauseChk" checked><span>Automatinė pauzė, kai nejuda</span></label>
                     <button id="toggleMoreBtn" type="button" class="link-btn">Daugiau nustatymų</button>
                     <div id="moreOpts" class="hidden">
                         <label class="field-label">Spalva</label>
@@ -129,6 +131,7 @@
                         <div class="live-stat"><span id="lblSpeed">Tempas</span><b id="statSpeed">--</b></div>
                         <div class="live-stat"><span>Sukilimas</span><b id="statElevation">0 m</b></div>
                     </div>
+                    <button id="pauseBtn" class="gps-btn pause" style="margin-top:8px;">Pauzė</button>
                     <button id="stopBtn" class="gps-btn stop">Baigti įrašymą</button>
                 </div>
             </div>
