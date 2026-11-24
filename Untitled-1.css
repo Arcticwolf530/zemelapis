@@ -41,7 +41,7 @@ button { font-family: inherit; }
 .tab-content.active { display: block; }
 .empty-tab-message { display: flex; flex-direction: column; gap: 12px; justify-content: center; align-items: center; height: 100%; color: #94a3b8; font-size: 16px; font-weight: 500; }
 
-#map, #map-history { position: absolute; inset: 0; z-index: 1; background: #e5ecf3; }
+#map, #map-history, #map-social { position: absolute; inset: 0; z-index: 1; background: #e5ecf3; }
 #map { bottom: 0; }
 #tab-record .leaflet-bottom { margin-bottom: var(--panel-h); }
 .leaflet-top.leaflet-right { margin-top: 0; }

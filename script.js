@@ -978,14 +978,19 @@ async function loadSocialHikes() {
         return;
     }
     const allRows = data || [];
-    // Savų žygių čia nerodome; įrašai be savininko (seni) irgi rodomi kaip „kitų“
-    socialLines = allRows
-        .filter(item => !item.user_id || item.user_id !== currentUser.id)
-        .map(item => mapZygisRow(item, item.author && item.author.email));
-    if (socialLines.length === 0) {
-        emptyBox.textContent = allRows.length === 0
-            ? 'Duomenų bazėje dar nėra jokių išsaugotų žygių.'
-            : 'Kitų vartotojų žygių dar nėra – visi ' + allRows.length + ' duomenų bazės žygiai priklauso jums. Kitų vartotojų žygiai čia atsiras, kai jie juos įrašys.';
+    const isOwn = (item) => item.user_id && item.user_id === currentUser.id;
+    const otherRows = allRows.filter(item => !isOwn(item));
+    const ownRows = allRows.filter(isOwn);
+    // Kitų žygiai pirmiausia; savieji – sąrašo gale su žyma „Jūs“,
+    // kad skiltis visada rodytų, ką veikia vartotojai (ir būtų galima išbandyti su viena paskyra)
+    socialLines = otherRows
+        .map(item => mapZygisRow(item, (item.author && item.author.email) || 'Kitas vartotojas'))
+        .concat(ownRows.map(item => mapZygisRow(item, 'Jūs')));
+    if (allRows.length === 0) {
+        emptyBox.textContent = 'Žygių nematyti. Jei žygiai tikrai išsaugoti, juos slepia duomenų bazės saugumas (RLS) – Supabase SQL Editor įvykdykite „supabase-social-policy.sql“ scenarijų.';
+        emptyBox.classList.remove('hidden');
+    } else if (otherRows.length === 0) {
+        emptyBox.textContent = 'Kitų vartotojų žygių dar nėra – jūsų žygiai pažymėti „Jūs“. Jei kitas vartotojas jau įrašė žygį, bet jo nesimato, Supabase SQL Editor įvykdykite „supabase-social-policy.sql“ scenarijų.';
         emptyBox.classList.remove('hidden');
     } else {
         emptyBox.classList.add('hidden');
